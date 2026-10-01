@@ -96,7 +96,9 @@ contract ReactiveEdgeTest is OrbitalFixture {
     function setUp() public override {
         super.setUp();
         proxy = new ProxyStandIn();
-        callback = new OrbitalDepegCallback(address(proxy), address(hook), rvmId, owner);
+        // The deployer owns the callback first (so a script can bind the hook), then hands over.
+        callback = new OrbitalDepegCallback(address(proxy), address(hook), rvmId);
+        callback.transferOwnership(owner);
         vm.prank(owner);
         hook.setGuardian(address(callback));
         reactive = new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
@@ -308,10 +310,66 @@ contract ReactiveEdgeTest is OrbitalFixture {
         vm.prank(owner);
         hook.pause();
         (bytes memory payload,) = reactAndCapture(reactive, 0.5e8, 1);
-        vm.expectEmit(true, false, false, true, address(callback));
-        emit OrbitalDepegCallback.DepegPauseTriggered(feed, 0.5e8, 1);
+        // The callback sees the hook is already paused, records the round and acknowledges without
+        // touching the hook (no `Paused` event, no revert): the delivery is still paid for and must
+        // not fail, or the proxy would retry it.
+        vm.recordLogs();
         (bool ok,) = proxy.deliver(address(callback), payload, rvmId);
         assertTrue(ok, "idempotent pause does not fail the delivery");
+        assertTrue(hook.paused());
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 1, "exactly one acknowledgement, nothing from the hook");
+        assertEq(logs[0].emitter, address(callback));
+        assertEq(logs[0].topics[0], keccak256("DepegAlreadyPaused(address,int256,uint256)"));
+        assertEq(callback.lastRoundId(feed), 1, "the round still counts as acted on");
+        // After the owner resumes, the same round cannot re-pause (stale), a newer one can.
+        vm.prank(owner);
+        hook.unpause();
+        (ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertFalse(hook.paused(), "a round already acted on never re-pauses");
+        (payload,) = reactAndCapture(reactive, 1e8, 2); // in band: re-arm
+        (payload,) = reactAndCapture(reactive, 0.5e8, 3);
+        (ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused(), "a newer out-of-band round pauses again");
+    }
+
+    /// The reactive side latches on the first out-of-band round and requests exactly one callback
+    /// per excursion. If that one delivery fails on the destination (here: the callback is not yet
+    /// bound to a hook; a wrong RVM id, an unset guardian or an unfunded callback behave the same),
+    /// nothing retries it: every later round of the same excursion is only `DepegPersists`, and the
+    /// pool stays open until a human pauses it or the price returns in band and leaves again.
+    /// Reported in the findings file as a liveness gap of the keeper-free design.
+    function test_failedDeliveryIsNotRetriedWithinTheExcursion() public {
+        OrbitalDepegCallback unbound = new OrbitalDepegCallback(address(proxy), address(0), rvmId);
+        OrbitalDepegReactive r =
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(unbound), 500_000, PEG, BAND_BPS);
+        vm.prank(owner);
+        hook.setGuardian(address(unbound));
+
+        (bytes memory payload, bool emitted) = reactAndCapture(r, 0.5e8, 1);
+        assertTrue(emitted, "one callback for the excursion");
+        (bool ok, bytes memory ret) = proxy.deliver(address(unbound), payload, rvmId);
+        assertFalse(ok, "delivery fails on the destination");
+        assertEq(bytes4(ret), OrbitalDepegCallback.HookNotSet.selector);
+        assertFalse(hook.paused());
+
+        // The operator fixes the destination, but the excursion is already latched: ten more
+        // out-of-band rounds request nothing.
+        unbound.setHook(address(hook));
+        for (uint256 round = 2; round <= 11; round++) {
+            (, emitted) = reactAndCapture(r, 0.5e8, round);
+            assertFalse(emitted, "no retry while the excursion lasts");
+        }
+        assertFalse(hook.paused(), "the pool trades through the depeg");
+        // Only a return in band re-arms the breaker; the next excursion is then caught.
+        (, emitted) = reactAndCapture(r, 1e8, 12);
+        assertFalse(emitted);
+        (payload, emitted) = reactAndCapture(r, 0.5e8, 13);
+        assertTrue(emitted);
+        (ok,) = proxy.deliver(address(unbound), payload, rvmId);
+        assertTrue(ok);
         assertTrue(hook.paused());
     }
 
@@ -344,7 +402,8 @@ contract ReactiveEdgeTest is OrbitalFixture {
         (bool ok, bytes memory ret) = other.deliver(address(callback), payload, rvmId);
         assertFalse(ok);
         assertEq(bytes4(ret), OrbitalDepegCallback.NotCallbackProxy.selector);
-        OrbitalDepegCallback fresh = new OrbitalDepegCallback(address(other), address(hook), rvmId, owner);
+        OrbitalDepegCallback fresh = new OrbitalDepegCallback(address(other), address(hook), rvmId);
+        fresh.transferOwnership(owner);
         vm.prank(owner);
         hook.setGuardian(address(fresh));
         (ok,) = other.deliver(address(fresh), payload, rvmId);
@@ -403,14 +462,45 @@ contract ReactiveEdgeTest is OrbitalFixture {
         assertEq(address(reactive).balance, 2 ether);
     }
 
-    function test_reactRejectsTheSameLogShapeFromAnotherAggregator() public {
-        // A log from a different feed on the right chain with the right topic is still refused:
-        // the breaker watches exactly one aggregator.
+    function test_anotherAggregatorIsLatchedAndRoundTrackedOnItsOwn() public {
+        // The ReactVM copy does not filter on the emitter (the Reactive Network copy's subscription
+        // does, so a rotated aggregator can be followed without redeploying). What it must do is
+        // keep every aggregator's latch and round counter apart: a log from a second feed trips
+        // independently of the first feed's state, and its low round numbers are not "stale"
+        // because the first feed is already at a high round.
+        (bytes memory first,) = reactAndCapture(reactive, 0.5e8, 1_000);
+        (bool ok,) = proxy.deliver(address(callback), first, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused());
+        assertTrue(reactive.tripped(feed), "first feed latched");
+        vm.prank(owner);
+        hook.unpause();
+
+        address other = makeAddr("eth-usd-aggregator");
         IReactive.LogRecord memory rec = logRecord(0.1e8, 1);
-        rec._contract = makeAddr("eth-usd-aggregator");
+        rec._contract = other;
+        vm.recordLogs();
+        vm.prank(SERVICE);
+        reactive.react(rec);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes memory payload;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == keccak256("Callback(uint256,address,uint64,bytes)")) {
+                payload = abi.decode(logs[i].data, (bytes));
+            }
+        }
+        assertGt(payload.length, 0, "second feed trips although the first is still latched");
+        assertTrue(reactive.tripped(other));
+        assertTrue(reactive.tripped(feed), "first feed's latch untouched");
+        (ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused(), "round 1 of the other feed is not stale against round 1000 of the first");
+        assertEq(callback.lastRoundId(other), 1);
+        assertEq(callback.lastRoundId(feed), 1_000);
+        // Logs that are not AnswerUpdated on the origin chain are still refused whoever emits them.
+        rec.topic_0 = uint256(keccak256("Transfer(address,address,uint256)"));
         vm.prank(SERVICE);
         vm.expectRevert(OrbitalDepegReactive.UnexpectedLog.selector);
         reactive.react(rec);
-        assertFalse(hook.paused());
     }
 }

@@ -30,10 +30,11 @@ contract OrbitalHandler is Test {
     uint256 public maxScale;
     uint256 public seedRadius;
     uint256 public minTotalRadius; // smallest total radius the pool has had since seeding
-    /// @dev The pool never shrinks below this: a dust-sized pool is the reported deposit-skim
-    /// regime (wei-level reserves make every later proportional deposit and every derived tick
-    /// status meaningless), and the implementation has no residual floor on withdrawals.
-    uint256 public constant MIN_POOL_RADIUS = 10_000e18;
+    /// @dev The pool never shrinks below this, so that every sequence keeps trading against real
+    /// liquidity (a few units of radius) rather than ending in a pool nobody can trade with. The
+    /// implementation's own floor (`MIN_RADIUS` per position and per tick) is exercised separately
+    /// by `withdraw`, which also asks for residuals below it and expects `ResidualTooSmall`.
+    uint256 public constant MIN_POOL_RADIUS = 10e18;
     PoolKey[3] internal keys; // (0,1), (0,2), (1,2)
     uint8[3][2] internal pairIdx;
 
@@ -62,7 +63,7 @@ contract OrbitalHandler is Test {
     uint256 public crossings;
     uint256 public pausedBlocks;
     uint256 public roundTrips;
-    uint256 public lowerArcAvoided; // swaps rolled back because they hit the reported crossing defect
+    uint256 public residualRefusals; // withdrawals refused for leaving less than MIN_RADIUS behind
 
     uint256 internal constant MAX_RADIUS_PER_DEPOSIT = 3_000_000e18;
 
@@ -176,13 +177,11 @@ contract OrbitalHandler is Test {
         minTotalRadius = radius;
     }
 
-    /// @dev True when the pool is in the configuration the implementation cannot represent: a
-    /// tick is pinned while the interior's off-peg component points against the pinned ticks'
-    /// (global ‖w‖ below the boundary sum), or a pinned tick sits above the interior position. The
-    /// implementation's endpoint-only crossing check lets ordinary return trades enter this state;
-    /// that is a reported defect (with its own proof), so the handler rolls such swaps back and
-    /// counts them instead of letting every later property fail on a state the model has no
-    /// meaning for.
+    /// @dev True when the pool is in a configuration the model has no meaning for: a tick is
+    /// pinned while the interior's off-peg component points against the pinned ticks' (global ‖w‖
+    /// below the boundary sum), or a pinned tick sits above the interior position. The crossing
+    /// logic must never commit such a state (an earlier revision did, on return trades through
+    /// the peg), so every executed swap asserts this is false afterwards.
     function inBrokenRegime() public view returns (bool) {
         uint256 mask = hook.boundaryMask();
         if (mask == 0) return false;
@@ -207,20 +206,15 @@ contract OrbitalHandler is Test {
         return false;
     }
 
-    /// @dev Runs a swap through the router; if it lands the pool in the broken regime, the state is
-    /// rolled back and the swap reported as not executed.
+    /// @dev Runs a quoted swap through the router. The quote succeeded, so the swap must too; the
+    /// state it leaves behind must be one the model can represent.
     function guardedSwap(address trader, PoolKey memory key, SwapParams memory params)
         internal
         returns (bool executed)
     {
-        uint256 snap = vm.snapshotState();
         vm.prank(trader);
         swapRouter.swap(key, params, settings(), "");
-        if (inBrokenRegime()) {
-            vm.revertToState(snap);
-            lowerArcAvoided++;
-            return false;
-        }
+        assertFalse(inBrokenRegime(), "swap committed an inverted boundary state");
         return true;
     }
 
@@ -242,8 +236,7 @@ contract OrbitalHandler is Test {
     function isAllowedRefusal(bytes4 sel) public pure returns (bool) {
         return sel == OrbitalHook.NoInteriorLiquidity.selector || sel == OrbitalMath.InsufficientLiquidity.selector
             || sel == OrbitalHook.SwapTooLarge.selector || sel == OrbitalHook.TooManyCrossings.selector
-            || sel == OrbitalMath.PlaneUnreachable.selector || sel == OrbitalHook.ZeroAmount.selector
-            || sel == OrbitalHook.AmountOverflow.selector;
+            || sel == OrbitalHook.ZeroAmount.selector || sel == OrbitalHook.AmountOverflow.selector;
     }
 
     function rethrow(bytes memory err) internal pure {
@@ -344,12 +337,12 @@ contract OrbitalHandler is Test {
         uint256 level = levelSeed % levelCount;
         uint256 held = hook.positions(level, lp);
         if (held == 0) return;
-        // Keep the pool out of the dust regime (see MIN_POOL_RADIUS); full exits of a position are
-        // still exercised whenever other liquidity remains.
+        // Keep a few units of radius in the pool (see MIN_POOL_RADIUS); full exits of a position
+        // are still exercised whenever other liquidity remains.
         uint256 total = hook.totalRadius();
         if (total <= MIN_POOL_RADIUS) return;
-        uint256 cap = total - MIN_POOL_RADIUS;
-        uint256 radius = bound(radiusSeed, 1, held < cap ? held : cap);
+        uint256 radius = _compliantRadius(lp, level, held, _pickRadius(held, total - MIN_POOL_RADIUS, radiusSeed));
+        if (radius == 0) return;
 
         uint256[] memory lpBefore = new uint256[](n());
         uint256[] memory mgrBefore = new uint256[](n());
@@ -376,6 +369,48 @@ contract OrbitalHandler is Test {
         ghostTotalRadius -= radius;
         if (hook.totalRadius() < minTotalRadius) minTotalRadius = hook.totalRadius();
         withdrawalsOk++;
+    }
+
+    /// @dev A withdrawal radius: usually random up to `limit`; one attempt in four aims at leaving a
+    /// residual inside (0, MIN_RADIUS), which a random radius against a 1e24 position would
+    /// practically never do, so that the refusal path is actually exercised.
+    function _pickRadius(uint256 held, uint256 limit, uint256 radiusSeed) internal view returns (uint256 radius) {
+        if (radiusSeed % 4 == 0 && held > 1) {
+            uint256 minR = hook.MIN_RADIUS();
+            uint256 span = held - 1 < minR - 1 ? held - 1 : minR - 1;
+            radius = held - 1 - (radiusSeed >> 8) % span;
+        } else {
+            radius = bound(radiusSeed, 1, held < limit ? held : limit);
+        }
+        if (radius > limit) radius = limit;
+        if (radius > held) radius = held;
+    }
+
+    /// @dev The residual rule: what stays in the position and in the tick is zero or ≥ MIN_RADIUS.
+    /// A random `radius` usually breaks it; that attempt must be refused with ResidualTooSmall and
+    /// move nothing. Returns a compliant radius to withdraw instead (0 when there is none).
+    function _compliantRadius(address lp, uint256 level, uint256 held, uint256 radius) internal returns (uint256) {
+        uint256 minR = hook.MIN_RADIUS();
+        uint256 levelRadius = hook.level(level).radius;
+        bool bad =
+            (held - radius != 0 && held - radius < minR) || (levelRadius - radius != 0 && levelRadius - radius < minR);
+        if (!bad) return radius;
+
+        uint256 total = hook.totalRadius();
+        vm.prank(lp);
+        try hook.withdraw(level, radius, new uint256[](n())) {
+            revert("withdraw below the residual floor succeeded");
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), OrbitalHook.ResidualTooSmall.selector, "residual refusal reason");
+        }
+        assertEq(hook.positions(level, lp), held, "refused withdrawal moved radius");
+        assertEq(hook.totalRadius(), total, "refused withdrawal moved total radius");
+        residualRefusals++;
+
+        uint256 cap = total - MIN_POOL_RADIUS;
+        if (held <= cap && (levelRadius == held || levelRadius - held >= minR)) return held; // full exit
+        if (held > minR) return radius > held - minR ? held - minR : radius; // leave ≥ MIN_RADIUS
+        return 0;
     }
 
     function collectFees(uint256 lpSeed, uint256 levelSeed) external {
@@ -562,11 +597,8 @@ contract OrbitalHandler is Test {
 /// @notice Invariants over random call sequences against the Orbital hook. The hook holds every
 /// LP's tokens (as ERC-6909 claims on the PoolManager), so these are the solvency properties.
 ///
-/// The pool is seeded at launch size before the sequences start. Without that seed the handler's
-/// no-free-money property fails: a dust-sized first deposit lets sub-unit rounding move the
-/// virtual point far inside the sphere, and later proportional deposits inherit the excess for the
-/// next trader to take. That is a defect of the implementation, reported in the findings file with
-/// a stand-alone proof; it is not tolerated here, it is simply outside this suite's regime.
+/// The pool is seeded at launch size before the sequences start, as a deployer would; the
+/// sequences may then shrink it to a few units of radius and grow it again.
 contract OrbitalHookInvariantTest is StdInvariant, OrbitalFixture {
     OrbitalHandler handler;
     address lp2 = makeAddr("lp2");

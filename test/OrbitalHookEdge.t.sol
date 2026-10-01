@@ -303,12 +303,23 @@ contract OrbitalHookEdgeTest is OrbitalFixture {
         bool z = isZeroForOne(keyAB, address(usdA));
         uint256 b0 = usdB.balanceOf(trader);
         uint256 a0 = usdA.balanceOf(trader);
+        // Opening the pool rounds the equal-price point up by at most r/(N·1e18) per coin, so the
+        // state point starts a hair inside the sphere. The first trade, however small, collects that
+        // dust (a few million wei here, ~1e-12 of a token for 3e24 of radius) and leaves the point on
+        // the surface; it can never collect more than the opening rounding.
+        uint256 openingDust = hook.n() * hook.totalRadius() / 1e18 + 1;
         swapAs(trader, keyAB, z, -1);
-        assertLe(usdB.balanceOf(trader) - b0, 1, "one wei in, at most one wei out");
+        assertLe(usdB.balanceOf(trader) - b0, 1 + openingDust, "one wei in buys at most one wei plus the opening dust");
         assertEq(a0 - usdA.balanceOf(trader), 1);
+        // From a point on the surface: one wei in buys at most two wei (α is tracked in units of
+        // 1/√N wei of Σx, so one wei of either coin can move it by one unit or none).
+        b0 = usdB.balanceOf(trader);
+        swapAs(trader, keyAB, z, -1);
+        assertLe(usdB.balanceOf(trader) - b0, 2, "one wei in, at most par plus one wei of rounding");
+        assertEq(a0 - usdA.balanceOf(trader), 2);
         // One wei out costs at least one wei in, fee included.
         swapAs(trader, keyAB, z, 1);
-        assertGe(a0 - usdA.balanceOf(trader), 2);
+        assertGe(a0 - usdA.balanceOf(trader), 3);
         // One raw unit of the 6-decimal coin out costs about 1e12 wei of an 18-decimal coin.
         uint256 paid = hook.quoteExactOutput(address(usdA), address(usdC), 1);
         assertGe(paid, 1e12, "never below par for one unit");
@@ -504,8 +515,17 @@ contract OrbitalHookEdgeTest is OrbitalFixture {
         assertGt(put[0] + put[1] + put[2], 0);
         assertEq(hook.level(TIGHT).radius, 2 * R);
         assertEq(hook.boundaryMask(), 1 << TIGHT);
-        // Note: a deposit into an *empty interior* tick in this state reverts (NoInteriorLiquidity);
-        // see the findings file — it is reported, not asserted here.
+        // Nothing trades without an interior, and nothing is stuck: a deposit into an empty tick
+        // above the pinned plane opens a fresh interior exactly on that plane and trading resumes.
+        (bool ok, bytes4 sel) = trySwap(trader, keyAB, isZeroForOne(keyAB, address(usdB)), -1e18);
+        assertFalse(ok);
+        assertEq(sel, OrbitalHook.NoInteriorLiquidity.selector);
+        depositAs(lp, MID, R);
+        (uint256 r,,) = hook.consolidated();
+        assertEq(r, R, "interior reopened");
+        assertApproxEqAbs(hook.alphaIntNorm(), int256(K_TIGHT), 10, "on the pinned plane");
+        (ok,) = trySwap(trader, keyAB, isZeroForOne(keyAB, address(usdB)), -1e18);
+        assertTrue(ok, "trading resumed");
     }
 
     // ---- fee edge values --------------------------------------------------------------------
