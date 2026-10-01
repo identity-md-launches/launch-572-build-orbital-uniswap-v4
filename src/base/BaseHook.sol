@@ -5,17 +5,20 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 
 /// @title BaseHook
-/// @notice Minimal Uniswap v4 hook base: every callback is restricted to the PoolManager and
-/// reverts with `HookNotImplemented` unless a child overrides the internal `_` variant.
+/// @notice Minimal Uniswap v4 hook base for a hook that implements `beforeInitialize`,
+/// `beforeAddLiquidity` and `beforeSwap`: those callbacks are restricted to the PoolManager and
+/// forwarded to internal `_` variants. Every other `IHooks` callback (and any other unknown
+/// selector) lands in the fallback and reverts `HookNotImplemented`. The PoolManager only calls
+/// the callbacks whose bits are set in the hook's address, so nothing else is ever reached; keeping
+/// the unused callbacks out of the dispatcher keeps the hook's runtime under the EIP-170 limit.
 /// @dev Written for this project (after the v4-periphery pattern) so the hook has no external
 /// library dependency beyond v4-core. The constructor checks that the deployed address carries
 /// exactly the permission bits that `getHookPermissions` declares.
-abstract contract BaseHook is IHooks {
+abstract contract BaseHook {
     error NotPoolManager();
     error HookNotImplemented();
 
@@ -23,7 +26,7 @@ abstract contract BaseHook is IHooks {
 
     constructor(IPoolManager _poolManager) {
         poolManager = _poolManager;
-        Hooks.validateHookPermissions(this, getHookPermissions());
+        Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
     }
 
     modifier onlyPoolManager() {
@@ -34,20 +37,17 @@ abstract contract BaseHook is IHooks {
     /// @notice The callbacks this hook implements. Must agree with the bits of its address.
     function getHookPermissions() public pure virtual returns (Hooks.Permissions memory);
 
+    /// @dev Any `IHooks` callback this hook does not implement, or any other unknown call.
+    fallback() external {
+        revert HookNotImplemented();
+    }
+
     function beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96)
         external
         onlyPoolManager
         returns (bytes4)
     {
         return _beforeInitialize(sender, key, sqrtPriceX96);
-    }
-
-    function afterInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96, int24 tick)
-        external
-        onlyPoolManager
-        returns (bytes4)
-    {
-        return _afterInitialize(sender, key, sqrtPriceX96, tick);
     }
 
     function beforeAddLiquidity(
@@ -59,37 +59,6 @@ abstract contract BaseHook is IHooks {
         return _beforeAddLiquidity(sender, key, params, hookData);
     }
 
-    function beforeRemoveLiquidity(
-        address sender,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
-        bytes calldata hookData
-    ) external onlyPoolManager returns (bytes4) {
-        return _beforeRemoveLiquidity(sender, key, params, hookData);
-    }
-
-    function afterAddLiquidity(
-        address sender,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
-        BalanceDelta delta,
-        BalanceDelta feesAccrued,
-        bytes calldata hookData
-    ) external onlyPoolManager returns (bytes4, BalanceDelta) {
-        return _afterAddLiquidity(sender, key, params, delta, feesAccrued, hookData);
-    }
-
-    function afterRemoveLiquidity(
-        address sender,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata params,
-        BalanceDelta delta,
-        BalanceDelta feesAccrued,
-        bytes calldata hookData
-    ) external onlyPoolManager returns (bytes4, BalanceDelta) {
-        return _afterRemoveLiquidity(sender, key, params, delta, feesAccrued, hookData);
-    }
-
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
         external
         onlyPoolManager
@@ -98,113 +67,15 @@ abstract contract BaseHook is IHooks {
         return _beforeSwap(sender, key, params, hookData);
     }
 
-    function afterSwap(
-        address sender,
-        PoolKey calldata key,
-        SwapParams calldata params,
-        BalanceDelta delta,
-        bytes calldata hookData
-    ) external onlyPoolManager returns (bytes4, int128) {
-        return _afterSwap(sender, key, params, delta, hookData);
-    }
-
-    function beforeDonate(
-        address sender,
-        PoolKey calldata key,
-        uint256 amount0,
-        uint256 amount1,
-        bytes calldata hookData
-    ) external onlyPoolManager returns (bytes4) {
-        return _beforeDonate(sender, key, amount0, amount1, hookData);
-    }
-
-    function afterDonate(
-        address sender,
-        PoolKey calldata key,
-        uint256 amount0,
-        uint256 amount1,
-        bytes calldata hookData
-    ) external onlyPoolManager returns (bytes4) {
-        return _afterDonate(sender, key, amount0, amount1, hookData);
-    }
-
-    // ---- overridable internals -------------------------------------------------------------
-
-    function _beforeInitialize(address, PoolKey calldata, uint160) internal virtual returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    function _afterInitialize(address, PoolKey calldata, uint160, int24) internal virtual returns (bytes4) {
-        revert HookNotImplemented();
-    }
+    function _beforeInitialize(address, PoolKey calldata, uint160) internal virtual returns (bytes4);
 
     function _beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         internal
         virtual
-        returns (bytes4)
-    {
-        revert HookNotImplemented();
-    }
-
-    function _beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        internal
-        virtual
-        returns (bytes4)
-    {
-        revert HookNotImplemented();
-    }
-
-    function _afterAddLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) internal virtual returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
-    function _afterRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) internal virtual returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
+        returns (bytes4);
 
     function _beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)
         internal
         virtual
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
-        revert HookNotImplemented();
-    }
-
-    function _afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
-        internal
-        virtual
-        returns (bytes4, int128)
-    {
-        revert HookNotImplemented();
-    }
-
-    function _beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
-        internal
-        virtual
-        returns (bytes4)
-    {
-        revert HookNotImplemented();
-    }
-
-    function _afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
-        internal
-        virtual
-        returns (bytes4)
-    {
-        revert HookNotImplemented();
-    }
+        returns (bytes4, BeforeSwapDelta, uint24);
 }

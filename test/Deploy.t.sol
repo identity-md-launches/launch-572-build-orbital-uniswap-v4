@@ -9,10 +9,7 @@ import {HookFlags} from "../src/HookFlags.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 contract DeployTest is Test {
-    function test_deployWiresEverything() public {
-        PoolManager manager = new PoolManager(address(this));
-        DeployOrbital script = new DeployOrbital();
-
+    function config(PoolManager manager, address create2Deployer) internal returns (DeployOrbital.Config memory) {
         address[] memory basket = new address[](2);
         basket[0] = address(new MockERC20("A", "A", 0));
         basket[1] = address(new MockERC20("B", "B", 0));
@@ -22,8 +19,7 @@ contract DeployTest is Test {
         uint256[] memory ks = new uint256[](2);
         ks[0] = 0.5e18; // N = 2: range is (√2 − 1, 1/√2]
         ks[1] = 0.7e18;
-
-        DeployOrbital.Config memory cfg = DeployOrbital.Config({
+        return DeployOrbital.Config({
             poolManager: IPoolManager(address(manager)),
             owner: makeAddr("multisig"),
             basket: basket,
@@ -32,22 +28,36 @@ contract DeployTest is Test {
             feePpm: 300,
             callbackProxy: makeAddr("reactive-callback-proxy"),
             rvmId: makeAddr("reactive-deployer"),
-            create2Deployer: address(script)
+            create2Deployer: create2Deployer
         });
-        DeployOrbital.Deployed memory d = script.deploy(cfg);
+    }
 
+    function check(
+        DeployOrbital script,
+        DeployOrbital.Config memory cfg,
+        DeployOrbital.Deployed memory d,
+        address deployer
+    ) internal view {
         assertTrue(HookFlags.matches(address(d.hook), script.HOOK_FLAGS()), "mined address carries the flags");
-        assertEq(address(d.hook.poolManager()), address(manager));
-        assertEq(d.hook.owner(), cfg.owner, "ownership handed to the multisig");
-        assertEq(d.hook.guardian(), address(d.callback), "callback is the guardian");
+        assertEq(address(d.hook.poolManager()), address(cfg.poolManager));
+        assertEq(d.hook.owner(), cfg.owner, "hook owned by the multisig from its constructor");
+        assertEq(d.hook.guardian(), address(d.callback), "callback is the guardian from the constructor");
         assertEq(d.hook.feePpm(), 300);
         assertEq(d.hook.levelCount(), 2);
-        assertEq(address(d.callback.hook()), address(d.hook));
+        assertEq(address(d.callback.hook()), address(d.hook), "callback bound to the hook");
         assertEq(d.callback.callbackProxy(), cfg.callbackProxy);
         assertEq(d.callback.rvmId(), cfg.rvmId);
-        assertEq(d.callback.owner(), cfg.owner);
+        assertEq(d.callback.owner(), cfg.owner, "callback handed to the multisig");
         assertEq(d.token.totalSupply(), 1e27);
-        assertEq(d.token.balanceOf(address(script)), 1e27, "supply minted to the deployer");
+        assertEq(d.token.balanceOf(deployer), 1e27, "supply minted to the deployer");
+    }
+
+    function test_deployWiresEverything() public {
+        PoolManager manager = new PoolManager(address(this));
+        DeployOrbital script = new DeployOrbital();
+        DeployOrbital.Config memory cfg = config(manager, address(script));
+        DeployOrbital.Deployed memory d = script.deploy(cfg);
+        check(script, cfg, d, address(script));
     }
 
     function test_mineSaltFindsMatchingAddress() public {
@@ -57,5 +67,21 @@ contract DeployTest is Test {
         address predicted =
             address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(code))))));
         assertTrue(HookFlags.matches(predicted, HookFlags.BEFORE_SWAP | HookFlags.AFTER_SWAP));
+    }
+}
+
+/// @notice The same `deploy` under `vm.startBroadcast`, where every call the script makes is sent
+/// from the broadcaster EOA and `new{salt:}` goes through the default CREATE2 deployer, exactly as
+/// `forge script --broadcast` does. No owner-only call on the hook is needed.
+contract DeployBroadcastTest is DeployTest, DeployOrbital {
+    function test_deployUnderBroadcast() public {
+        PoolManager manager = new PoolManager(address(this));
+        Config memory cfg = config(manager, DEFAULT_CREATE2_DEPLOYER);
+        address broadcaster = makeAddr("broadcaster");
+        vm.deal(broadcaster, 1 ether);
+        vm.startBroadcast(broadcaster);
+        Deployed memory d = deploy(cfg);
+        vm.stopBroadcast();
+        check(this, cfg, d, broadcaster);
     }
 }

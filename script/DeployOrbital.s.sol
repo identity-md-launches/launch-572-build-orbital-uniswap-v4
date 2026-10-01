@@ -9,8 +9,8 @@ import {OrbitalDepegCallback} from "../src/reactive/OrbitalDepegCallback.sol";
 import {HookFlags} from "../src/HookFlags.sol";
 
 /// @title DeployOrbital
-/// @notice Deploys the ORB launch token, the Orbital hook at a mined CREATE2 address and the
-/// Reactive depeg callback, then wires the callback in as the hook's guardian.
+/// @notice Deploys the ORB launch token, the Reactive depeg callback, and the Orbital hook at a
+/// mined CREATE2 address with the callback already set as its guardian.
 /// @dev `deploy` is pure configuration-in, addresses-out so tests exercise it directly. `run`
 /// only reads the environment and forwards; nothing here hardcodes a chain address.
 contract DeployOrbital is Script {
@@ -57,24 +57,29 @@ contract DeployOrbital is Script {
         vm.stopBroadcast();
     }
 
-    /// @notice Deploys everything. The hook's guardian is the callback; ownership of the hook ends
-    /// at `cfg.owner`, and the ORB supply ends with the broadcaster (this contract in tests).
+    /// @notice Deploys everything. The hook is created with `cfg.owner` as owner and the callback
+    /// as guardian from its constructor, so no owner-only call is ever needed on the hook. The
+    /// callback is deployed first (its first owner is whoever deploys it: the broadcaster under
+    /// `--broadcast`, this contract in tests), bound to the hook with the one-shot `setHook`, then
+    /// handed to `cfg.owner`. The ORB supply ends with the deployer.
     function deploy(Config memory cfg) public returns (Deployed memory d) {
         d.token = new OrbitalToken();
 
-        // The hook is first owned by the script so the guardian can be wired, then handed over.
+        d.callback = new OrbitalDepegCallback(cfg.callbackProxy, address(0), cfg.rvmId);
+
         bytes memory creationCode = abi.encodePacked(
             type(OrbitalHook).creationCode,
-            abi.encode(cfg.poolManager, address(this), address(0), cfg.basket, cfg.decimals, cfg.kNorms, cfg.feePpm)
+            abi.encode(
+                cfg.poolManager, cfg.owner, address(d.callback), cfg.basket, cfg.decimals, cfg.kNorms, cfg.feePpm
+            )
         );
         d.salt = mineSalt(cfg.create2Deployer, creationCode, HOOK_FLAGS);
         d.hook = new OrbitalHook{salt: d.salt}(
-            cfg.poolManager, address(this), address(0), cfg.basket, cfg.decimals, cfg.kNorms, cfg.feePpm
+            cfg.poolManager, cfg.owner, address(d.callback), cfg.basket, cfg.decimals, cfg.kNorms, cfg.feePpm
         );
 
-        d.callback = new OrbitalDepegCallback(cfg.callbackProxy, address(d.hook), cfg.rvmId, cfg.owner);
-        d.hook.setGuardian(address(d.callback));
-        d.hook.transferOwnership(cfg.owner);
+        d.callback.setHook(address(d.hook));
+        d.callback.transferOwnership(cfg.owner);
     }
 
     function toUint8(uint256[] memory xs) internal pure returns (uint8[] memory out) {

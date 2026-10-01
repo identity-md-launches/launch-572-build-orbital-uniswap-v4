@@ -10,8 +10,15 @@ import {IReactive, ISystemContract, IPayer} from "./IReactive.sol";
 /// Sepolia, 1301) targeting `OrbitalDepegCallback.depeg(...)`.
 ///
 /// Deployment model (per Reactive docs): the same bytecode is instantiated once on the Reactive
-/// Network (where it subscribes) and once inside the deployer's ReactVM (where `react` runs). The
-/// two copies tell each other apart by whether the system contract has code at its address.
+/// Network (where it subscribes and the owner manages subscriptions) and once inside the deployer's
+/// ReactVM (where `react` runs, in transactions sent from the RVM id — the deployer EOA). The two
+/// copies tell each other apart by whether the system contract has code at its address. The ReactVM
+/// copy's storage can only change through `react`, so the subscription on the Reactive Network copy
+/// is what decides which aggregator's logs reach it; `react` validates the chain and the event
+/// signature and takes the emitter from the log.
+///
+/// The breaker is latched per emitter: the first out-of-band round of an excursion requests one
+/// callback; further out-of-band rounds only log `DepegPersists` until an in-band round re-arms it.
 contract OrbitalDepegReactive is IReactive, IPayer {
     /// @dev Reactive system contract; present on the Reactive Network, absent in the ReactVM.
     address public constant SERVICE = 0x0000000000000000000000000000000000fffFfF;
@@ -24,21 +31,30 @@ contract OrbitalDepegReactive is IReactive, IPayer {
     bool public immutable isReactVm;
 
     uint256 public immutable originChainId;
-    address public immutable feed;
     uint256 public immutable destinationChainId;
     address public immutable callbackContract;
     uint64 public immutable callbackGasLimit;
     int256 public immutable pegPrice; // in feed decimals, e.g. 1e8 for a USD feed
     uint256 public immutable bandBps; // allowed deviation, basis points
 
+    /// @notice Aggregator currently subscribed to (Reactive Network copy; the ReactVM copy keeps
+    /// the value it was deployed with and does not filter on it).
+    address public feed;
+    /// @notice Latch per emitter: true after a callback was requested for an excursion that has
+    /// not yet seen an in-band round.
+    mapping(address => bool) public tripped;
+
     event DepegDetected(address indexed feed, int256 price, uint256 roundId);
+    event DepegPersists(address indexed feed, int256 price, uint256 roundId);
     event PriceInBand(address indexed feed, int256 price, uint256 roundId);
+    event FeedUpdated(address indexed previousFeed, address indexed newFeed);
 
     error NotOwner();
     error NotSystemContract();
     error UnexpectedLog();
     error InvalidConfig();
     error ReactiveNetworkOnly();
+    error ReactiveVmOnly();
     error PaymentFailed();
 
     modifier onlyOwner() {
@@ -68,12 +84,7 @@ contract OrbitalDepegReactive is IReactive, IPayer {
         bandBps = _bandBps;
 
         isReactVm = SERVICE.code.length == 0;
-        if (!isReactVm) {
-            ISystemContract(SERVICE)
-                .subscribe(
-                    _originChainId, _feed, ANSWER_UPDATED_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE
-                );
-        }
+        if (!isReactVm) _subscribe(_feed);
     }
 
     /// @notice True when `price` is outside [peg·(1 − band), peg·(1 + band)] or not positive.
@@ -84,40 +95,69 @@ contract OrbitalDepegReactive is IReactive, IPayer {
     }
 
     /// @inheritdoc IReactive
-    /// @dev Called by the ReactVM for every log matching the subscription. The price is
-    /// `AnswerUpdated`'s first indexed argument (`current`), the round id the second.
+    /// @dev Runs only inside the ReactVM, where the Reactive Network delivers every log matching the
+    /// subscription as a transaction from the RVM id. There is no system-contract sender to check
+    /// (it has no code there), which is also how `reactive-lib`'s `AbstractReactive` guards `react`.
+    /// The price is `AnswerUpdated`'s first indexed argument (`current`), the round id the second.
     function react(LogRecord calldata log) external override {
-        if (msg.sender != SERVICE) revert NotSystemContract();
-        if (log.chain_id != originChainId || log._contract != feed || log.topic_0 != ANSWER_UPDATED_TOPIC) {
-            revert UnexpectedLog();
-        }
+        if (!isReactVm) revert ReactiveVmOnly();
+        if (log.chain_id != originChainId || log.topic_0 != ANSWER_UPDATED_TOPIC) revert UnexpectedLog();
+        address emitter = log._contract;
         int256 price = int256(log.topic_1);
         uint256 roundId = log.topic_2;
         if (!isOutOfBand(price)) {
-            emit PriceInBand(feed, price, roundId);
+            if (tripped[emitter]) tripped[emitter] = false; // re-arm
+            emit PriceInBand(emitter, price, roundId);
             return;
         }
-        emit DepegDetected(feed, price, roundId);
+        if (tripped[emitter]) {
+            emit DepegPersists(emitter, price, roundId);
+            return;
+        }
+        tripped[emitter] = true;
+        emit DepegDetected(emitter, price, roundId);
         // First argument is a placeholder: the callback proxy replaces it with the RVM id.
         bytes memory payload =
-            abi.encodeWithSignature("depeg(address,address,int256,uint256)", address(0), feed, price, roundId);
+            abi.encodeWithSignature("depeg(address,address,int256,uint256)", address(0), emitter, price, roundId);
         emit Callback(destinationChainId, callbackContract, callbackGasLimit, payload);
     }
 
-    // ---- operations -------------------------------------------------------------------------
+    // ---- operations (Reactive Network copy only) -------------------------------------------
 
-    /// @notice Re-create the subscription (Reactive Network copy only).
+    /// @notice Re-create the subscription to the current feed.
     function subscribe() external onlyOwner {
         if (isReactVm) revert ReactiveNetworkOnly();
-        ISystemContract(SERVICE)
-            .subscribe(originChainId, feed, ANSWER_UPDATED_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
+        _subscribe(feed);
     }
 
-    /// @notice Stop watching the feed (Reactive Network copy only).
+    /// @notice Stop watching the current feed.
     function unsubscribe() external onlyOwner {
         if (isReactVm) revert ReactiveNetworkOnly();
+        _unsubscribe(feed);
+    }
+
+    /// @notice Follow a Chainlink aggregator rotation: drop the old subscription (best effort, so
+    /// an already-removed subscription cannot block the switch) and subscribe to `newFeed`.
+    function setFeed(address newFeed) external onlyOwner {
+        if (isReactVm) revert ReactiveNetworkOnly();
+        if (newFeed == address(0)) revert InvalidConfig();
+        address old = feed;
+        feed = newFeed;
+        try ISystemContract(SERVICE)
+            .unsubscribe(originChainId, old, ANSWER_UPDATED_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE) {}
+            catch {}
+        _subscribe(newFeed);
+        emit FeedUpdated(old, newFeed);
+    }
+
+    function _subscribe(address _feed) internal {
         ISystemContract(SERVICE)
-            .unsubscribe(originChainId, feed, ANSWER_UPDATED_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
+            .subscribe(originChainId, _feed, ANSWER_UPDATED_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
+    }
+
+    function _unsubscribe(address _feed) internal {
+        ISystemContract(SERVICE)
+            .unsubscribe(originChainId, _feed, ANSWER_UPDATED_TOPIC, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
     }
 
     /// @inheritdoc IPayer

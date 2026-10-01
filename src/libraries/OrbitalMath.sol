@@ -22,13 +22,17 @@ pragma solidity 0.8.26;
 /// s_norm = √(1 − (√N − k_norm)²). A tick is interior while the interior's normalised position
 /// α_int / r_int is below its k_norm, and pinned to its plane (boundary) once above it.
 ///
+/// α is not monotonic along a trade: adding token i and removing token j lowers α while xᵢ < xⱼ
+/// and raises it afterwards (the marginal price is 1 exactly at xᵢ = xⱼ). The interior can only
+/// reach its own equal-price point (‖w‖ = s_bound) once every tick has rejoined it, because each
+/// k_norm exceeds √N − 1, so ‖w‖ ≥ s_bound holds on every valid state.
+///
 /// Everything is `internal` on purpose: the hook's runtime must contain no DELEGATECALL.
 library OrbitalMath {
     uint256 internal constant WAD = 1e18;
 
     error InsufficientLiquidity();
     error MathOverflow();
-    error PlaneUnreachable();
 
     struct Consolidated {
         uint256 r; // interior radius sum (WAD)
@@ -204,23 +208,35 @@ library OrbitalMath {
     }
 
     /// @notice Move along eᵢ − eⱼ inside the plane S = sT until Σx² = qT.
-    /// @dev Used to land exactly on a tick boundary. Returns the input `t` added to token i; the
-    /// output removed from token j is `t − (sT − s)`.
-    function planeStep(Pair memory p, uint256 sT, uint256 qT) internal pure returns (uint256 t, uint256 dOut) {
+    /// @dev Used to land exactly on a tick boundary. The two points of the (i, j)-plane with that
+    /// S and Q are mirror images (xᵢ and xⱼ swapped); `iHeavy` selects the one with xᵢ ≥ xⱼ.
+    /// A trade that adds i and removes j has xᵢ increasing throughout, so a plane met before the
+    /// trade's turning point (xᵢ = xⱼ, where α is minimal) is the j-heavy image and one met after
+    /// it is the i-heavy image. Returns `ok = false` when the plane lies behind the trade or the
+    /// path never reaches it (Q = qT unattainable); a discriminant within rounding of zero is
+    /// treated as a tangent touch. `t` is the input added to token i, `dOut` the output removed
+    /// from token j (`t − (sT − s)`).
+    function tryPlaneStep(Pair memory p, uint256 sT, uint256 qT, bool iHeavy)
+        internal
+        pure
+        returns (bool ok, uint256 t, uint256 dOut)
+    {
         int256 cShift = int256(sT) - int256(p.s);
         int256 a = int256(p.xi);
         int256 b = int256(p.xj) + cShift;
-        if (b < 0) revert PlaneUnreachable();
+        if (b < 0) return (false, 0, 0);
         int256 cq = int256(qT) - int256(p.q - p.xi * p.xi - p.xj * p.xj);
-        int256 disc = 2 * cq - (a + b) * (a + b);
-        if (disc < 0) disc = 0;
+        int256 sumAB = a + b;
+        int256 disc = 2 * cq - sumAB * sumAB;
+        if (disc < 0) {
+            // Rounding noise in qT is ~1e-18 of (a+b)²; anything more negative is a genuine miss.
+            if (-disc > sumAB * sumAB / int256(WAD) + 1e20) return (false, 0, 0);
+            disc = 0;
+        }
         int256 root = int256(sqrt(uint256(disc)));
         int256 tMin = cShift > 0 ? cShift : int256(0);
-        int256 t1 = (b - a - root) / 2;
-        int256 t2 = (b - a + root) / 2;
-        int256 chosen = t1 >= tMin ? t1 : t2;
-        if (chosen < tMin) revert PlaneUnreachable();
-        t = uint256(chosen);
-        dOut = uint256(chosen - cShift);
+        int256 chosen = iHeavy ? (b - a + root) / 2 : (b - a - root) / 2;
+        if (chosen < tMin) return (false, 0, 0);
+        return (true, uint256(chosen), uint256(chosen - cShift));
     }
 }

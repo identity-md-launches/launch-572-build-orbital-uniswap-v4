@@ -126,9 +126,42 @@ contract OrbitalMathTest is Test {
     function test_planeStepStaysPutAtZeroShift() public pure {
         uint256 each = 1e24;
         OrbitalMath.Pair memory p = OrbitalMath.Pair(each, each, 3 * each, 3 * each * each);
-        (uint256 t, uint256 dOut) = OrbitalMath.planeStep(p, p.s, p.q);
+        (bool ok, uint256 t, uint256 dOut) = OrbitalMath.tryPlaneStep(p, p.s, p.q, false);
+        assertTrue(ok);
         assertEq(t, 0);
         assertEq(dOut, 0);
+        (ok, t, dOut) = OrbitalMath.tryPlaneStep(p, p.s, p.q, true);
+        assertTrue(ok);
+        assertEq(t, 0);
+    }
+
+    function test_planeStepPicksTheRequestedImage() public pure {
+        // j-heavy start: x_i = 0.9e24, x_j = 1.1e24, third coin at 1e24. Target the plane with the
+        // same S and Q as the current point: the j-heavy image is here (t = 0), the i-heavy image is
+        // the mirror (x_i and x_j swapped, t = 0.2e24).
+        OrbitalMath.Pair memory p = OrbitalMath.Pair(0.9e24, 1.1e24, 3e24, 0.81e48 + 1.21e48 + 1e48);
+        (bool ok, uint256 t, uint256 dOut) = OrbitalMath.tryPlaneStep(p, p.s, p.q, false);
+        assertTrue(ok);
+        assertEq(t, 0);
+        assertEq(dOut, 0);
+        (ok, t, dOut) = OrbitalMath.tryPlaneStep(p, p.s, p.q, true);
+        assertTrue(ok);
+        assertEq(t, 0.2e24);
+        assertEq(dOut, 0.2e24);
+        // Q = 3e48 is the least Q on this plane (x_i = x_j = 1e24): a tangent touch, reached at
+        // the turning point by either image.
+        (ok, t, dOut) = OrbitalMath.tryPlaneStep(p, p.s, 3e48, false);
+        assertTrue(ok);
+        assertEq(t, 0.1e24);
+        assertEq(dOut, 0.1e24);
+        // Below that the plane cannot be reached: reported, not clamped.
+        (ok,,) = OrbitalMath.tryPlaneStep(p, p.s, 2.9e48, false);
+        assertFalse(ok);
+        (ok,,) = OrbitalMath.tryPlaneStep(p, p.s, 2.9e48, true);
+        assertFalse(ok);
+        // A plane behind the trade (needs x_i to shrink) is reported too.
+        (ok,,) = OrbitalMath.tryPlaneStep(OrbitalMath.Pair(1.1e24, 0.9e24, 3e24, p.q), p.s, p.q, false);
+        assertFalse(ok);
     }
 
     function test_hookFlags() public pure {

@@ -38,7 +38,15 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     uint256 public constant FEE_DENOMINATOR = 1_000_000; // parts per million, like v4
     uint24 public constant MAX_FEE_PPM = 10_000; // 1%
     uint256 public constant MAX_TOTAL_RADIUS = 1e30; // 10^12 tokens of radius
-    uint256 public constant MIN_RADIUS = 1e9; // keeps per-radius fee math meaningful
+    /// @dev Smallest radius a tick or a position may hold (one unit of radius ≈ 0.42 tokens per
+    /// coin at full range). Also the floor a partial withdrawal must leave behind, so the interior
+    /// position is never derived from a wei-sized pool.
+    uint256 public constant MIN_RADIUS = 1e18;
+    /// @dev Slack, in WAD units of normalised interior position (1e-15), within which a tick is
+    /// treated as sitting on its plane. Plane landings, deposits and withdrawals round the position
+    /// by a few units; without the slack a tick one unit off its plane could be left on the wrong
+    /// side by a trade that starts there.
+    int256 internal constant POSITION_TOLERANCE = 1e3;
 
     // ---- types ------------------------------------------------------------------------------
 
@@ -57,7 +65,8 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
 
     enum Action {
         Deposit,
-        Withdraw
+        Withdraw, // deliver tokens, fall back to ERC-6909 claims for a coin that refuses to move
+        Redeem // deliver tokens for claims the caller handed in; no fallback
     }
 
     struct CallbackData {
@@ -98,6 +107,8 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     event Deposit(address indexed lp, uint256 indexed level, uint256 radius, uint256[] amounts);
     event Withdraw(address indexed lp, uint256 indexed level, uint256 radius, uint256[] amounts);
     event FeesCollected(address indexed lp, uint256 indexed level, uint256[] amounts);
+    event ClaimsDelivered(address indexed account, address indexed token, uint256 amount);
+    event ClaimsRedeemed(address indexed account, address indexed token, uint256 amount, address to);
     event OrbitalSwap(
         address indexed sender, uint8 tokenIn, uint8 tokenOut, uint256 amountIn, uint256 amountOut, uint256 feeWad
     );
@@ -131,6 +142,8 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     error AmountOverflow();
     error TransferFailed();
     error LengthMismatch();
+    error ResidualTooSmall();
+    error BoundaryInverted();
 
     // ---- modifiers --------------------------------------------------------------------------
 
@@ -269,6 +282,9 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         if (paused) revert IsPaused();
         PoolMeta memory meta = pools[key.toId()];
         if (!meta.orbital) return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        // The manager is unlocked while this hook settles a deposit, withdrawal or fee payout; a
+        // swap started from inside that window (e.g. by a token's receiver hook) is refused.
+        if (_entered != 1) revert Reentrancy();
 
         bool exactIn = params.amountSpecified < 0;
         (uint256 rawIn, uint256 rawOut) = _execute(
@@ -300,7 +316,19 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         uint256 feeWad;
         uint256[] memory x;
         uint256 mask;
+        (rawIn, rawOut, feeWad, x, mask) = _price(i, j, exactIn, amount);
+        _commit(x, mask);
+        if (feeWad > 0) _feeGrowth[i] += feeWad * WAD / totalRadius;
+        emit OrbitalSwap(sender, i, j, rawIn, rawOut, feeWad);
+    }
 
+    /// @dev Prices a trade of basket token `i` for `j` in raw units, fee included, and returns the
+    /// resulting virtual reserves and tick mask. Shared by execution and the quote views.
+    function _price(uint8 i, uint8 j, bool exactIn, uint256 amount)
+        internal
+        view
+        returns (uint256 rawIn, uint256 rawOut, uint256 feeWad, uint256[] memory x, uint256 mask)
+    {
         if (exactIn) {
             rawIn = amount;
             uint256 wadIn = rawIn * _scale[i];
@@ -321,10 +349,6 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         if (rawIn > uint256(uint128(type(int128).max)) || rawOut > uint256(uint128(type(int128).max))) {
             revert AmountOverflow();
         }
-
-        _commit(x, mask);
-        if (feeWad > 0) _feeGrowth[i] += feeWad * WAD / totalRadius;
-        emit OrbitalSwap(sender, i, j, rawIn, rawOut, feeWad);
     }
 
     // ---- liquidity --------------------------------------------------------------------------
@@ -343,21 +367,18 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         if (maxAmounts.length != n) revert LengthMismatch();
         if (totalRadius + radius > MAX_TOTAL_RADIUS) revert RadiusCapExceeded();
 
-        Level[] memory lv = _loadLevels();
-        (uint256[] memory virt, bool boundary) = _levelVector(lv, levelId, radius);
+        // Pending fees are paid out first: that payout is an external token transfer, and every
+        // state change below happens only after it has returned.
+        _settleFees(levelId, msg.sender);
 
-        amounts = new uint256[](n);
-        Level storage L = _levels[levelId];
+        (uint256[] memory virt, uint256[] memory raw, bool boundary) = _depositAmounts(_loadLevels(), levelId, radius);
+        amounts = raw;
         for (uint256 k = 0; k < n; k++) {
-            uint256 floorK = radius * L.xMinNorm / WAD;
-            uint256 real = virt[k] > floorK ? virt[k] - floorK : 0;
-            uint256 raw = OrbitalMath.ceilDiv(real, _scale[k]);
-            if (raw > maxAmounts[k]) revert SlippageExceeded();
-            amounts[k] = raw;
+            if (amounts[k] > maxAmounts[k]) revert SlippageExceeded();
             _x[k] += virt[k]; // the sub-unit rounding surplus stays in the manager as dust
         }
 
-        _settleFees(levelId, msg.sender);
+        Level storage L = _levels[levelId];
         if (L.radius == 0) {
             if (boundary) boundaryMask |= (1 << levelId);
             else boundaryMask &= ~(1 << levelId);
@@ -371,6 +392,9 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     }
 
     /// @notice Remove `radius` from tick `level`; always available, even when paused.
+    /// @dev A partial withdrawal must leave at least `MIN_RADIUS` in the position and in the tick.
+    /// Every coin is delivered on its own: one whose transfer fails is handed over as an ERC-6909
+    /// claim on the PoolManager instead (see `redeemClaims`), never blocking the others.
     /// @return amounts Raw amounts returned per token (accrued fees are paid out separately).
     function withdraw(uint256 levelId, uint256 radius, uint256[] calldata minAmounts)
         external
@@ -382,32 +406,64 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         if (minAmounts.length != n) revert LengthMismatch();
         uint256 held = positions[levelId][msg.sender];
         if (radius > held) revert InsufficientPosition();
+        Level storage L = _levels[levelId];
+        if (
+            (held - radius != 0 && held - radius < MIN_RADIUS)
+                || (L.radius - radius != 0 && L.radius - radius < MIN_RADIUS)
+        ) {
+            revert ResidualTooSmall();
+        }
+
+        _settleFees(levelId, msg.sender);
 
         Level[] memory lv = _loadLevels();
-        (uint256[] memory virt,) = _levelVector(lv, levelId, radius);
+        (uint256[] memory virt,) = _levelVector(lv, levelId, radius, false);
         uint256 floorAll = _virtualFloor(lv);
 
         amounts = new uint256[](n);
-        Level storage L = _levels[levelId];
         for (uint256 k = 0; k < n; k++) {
             uint256 floorK = radius * L.xMinNorm / WAD;
             uint256 real = virt[k] > floorK ? virt[k] - floorK : 0;
             uint256 available = _x[k] > floorAll ? _x[k] - floorAll : 0;
             if (real > available) real = available;
             uint256 raw = real / _scale[k];
+            // Per-level floors round separately from the pool-wide floor, so the accounting can
+            // overstate backing by a wei; the claim balance is what can actually be paid.
+            uint256 backing = _claimBalance(k);
+            if (raw > backing) raw = backing;
             if (raw < minAmounts[k]) revert SlippageExceeded();
             amounts[k] = raw;
             uint256 removed = virt[k] > _x[k] ? _x[k] : virt[k];
             _x[k] -= removed;
         }
 
-        _settleFees(levelId, msg.sender);
         positions[levelId][msg.sender] = held - radius;
         L.radius -= radius;
         totalRadius -= radius;
+        if (totalRadius == 0) {
+            // Residual rounding dust stays with the manager; the next first deposit starts clean.
+            for (uint256 k = 0; k < n; k++) {
+                _x[k] = 0;
+            }
+        }
 
         poolManager.unlock(abi.encode(CallbackData({action: Action.Withdraw, account: msg.sender, amounts: amounts})));
         emit Withdraw(msg.sender, levelId, radius, amounts);
+    }
+
+    /// @notice Turn ERC-6909 claims on the PoolManager (as delivered by `withdraw`/`collectFees`
+    /// for a coin that could not be transferred at the time) back into `token`, sent to `to`.
+    /// The caller must first approve this hook on the PoolManager (`setOperator` or `approve`).
+    function redeemClaims(address token, uint256 amount, address to) external nonReentrant {
+        uint256 idx = tokenIndex[token];
+        if (idx == 0) revert InvalidTokens();
+        if (amount == 0) revert ZeroAmount();
+        if (to == address(0)) revert ZeroAddress();
+        poolManager.transferFrom(msg.sender, address(this), uint256(uint160(token)), amount);
+        uint256[] memory amounts = new uint256[](n);
+        amounts[idx - 1] = amount;
+        poolManager.unlock(abi.encode(CallbackData({action: Action.Redeem, account: to, amounts: amounts})));
+        emit ClaimsRedeemed(msg.sender, token, amount, to);
     }
 
     /// @notice Pay out the swap fees accrued to the caller's position in `level`.
@@ -418,22 +474,31 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
 
     /// @dev Pays pending fees for (level, lp) and resets its debt. Safe to call when radius is 0.
     function _settleFees(uint256 levelId, address lp) internal returns (uint256[] memory amounts) {
-        amounts = new uint256[](n);
-        uint256 radius = positions[levelId][lp];
         bool any;
+        (amounts, any) = _owed(levelId, lp);
         for (uint256 k = 0; k < n; k++) {
-            uint256 growth = _feeGrowth[k];
-            uint256 debt = _feeDebt[levelId][lp][k];
-            if (radius > 0 && growth > debt) {
-                uint256 owedWad = radius * (growth - debt) / WAD;
-                amounts[k] = owedWad / _scale[k];
-                if (amounts[k] > 0) any = true;
-            }
-            _feeDebt[levelId][lp][k] = growth;
+            _feeDebt[levelId][lp][k] = _feeGrowth[k];
         }
         if (any) {
             poolManager.unlock(abi.encode(CallbackData({action: Action.Withdraw, account: lp, amounts: amounts})));
             emit FeesCollected(lp, levelId, amounts);
+        }
+    }
+
+    /// @dev Fees owed to (level, lp) in raw units, capped at what the hook's claims can pay.
+    function _owed(uint256 levelId, address lp) internal view returns (uint256[] memory amounts, bool any) {
+        amounts = new uint256[](n);
+        uint256 radius = positions[levelId][lp];
+        if (radius == 0) return (amounts, false);
+        for (uint256 k = 0; k < n; k++) {
+            uint256 growth = _feeGrowth[k];
+            uint256 debt = _feeDebt[levelId][lp][k];
+            if (growth > debt) {
+                uint256 owed = radius * (growth - debt) / WAD / _scale[k];
+                uint256 backing = _claimBalance(k);
+                amounts[k] = owed > backing ? backing : owed;
+                if (amounts[k] > 0) any = true;
+            }
         }
     }
 
@@ -450,11 +515,25 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
                 poolManager.settle();
                 poolManager.mint(address(this), c.toId(), amount);
             } else {
-                poolManager.burn(address(this), c.toId(), amount);
-                poolManager.take(c, data.account, amount);
+                // `take` moves the ERC-20 out of the manager and debits this hook; the burn pays
+                // the debit. On a withdrawal or fee payout a coin whose transfer reverts (issuer
+                // pause, blocklist) must not strand the others: its claim is handed to the account
+                // instead. A redeem has no fallback.
+                try poolManager.take(c, data.account, amount) {
+                    poolManager.burn(address(this), c.toId(), amount);
+                } catch {
+                    if (data.action == Action.Redeem) revert TransferFailed();
+                    poolManager.transfer(data.account, c.toId(), amount);
+                    emit ClaimsDelivered(data.account, _tokens[k], amount);
+                }
             }
         }
         return "";
+    }
+
+    /// @dev ERC-6909 claims of basket token `k` this hook holds on the manager.
+    function _claimBalance(uint256 k) internal view returns (uint256) {
+        return poolManager.balanceOf(address(this), uint256(uint160(_tokens[k])));
     }
 
     // ---- circuit breaker & admin ------------------------------------------------------------
@@ -534,7 +613,7 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     function levelReserves(uint256 l) external view returns (uint256[] memory) {
         Level[] memory lv = _loadLevels();
         if (lv[l].radius == 0) return new uint256[](n);
-        (uint256[] memory v,) = _levelVector(lv, l, lv[l].radius);
+        (uint256[] memory v,) = _levelVector(lv, l, lv[l].radius, false);
         return v;
     }
 
@@ -544,12 +623,13 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         return (c.r, c.kb, c.sb);
     }
 
-    /// @notice Normalised interior position (WAD). Ticks with kNorm below it are boundary.
+    /// @notice Normalised interior position (WAD). Ticks with kNorm below it are boundary. With
+    /// only pinned liquidity left this is the highest pinned plane; with no liquidity, `int256.max`.
     function alphaIntNorm() external view returns (int256) {
-        OrbitalMath.Consolidated memory c = _consolidate(_loadLevels(), boundaryMask);
-        if (c.r == 0) return type(int256).max;
+        if (totalRadius == 0) return type(int256).max;
+        Level[] memory lv = _loadLevels();
         (uint256 s,) = _sums(_x);
-        return OrbitalMath.alphaIntNorm(s, sqrtN, c);
+        return _position(lv, boundaryMask, s, _consolidate(lv, boundaryMask));
     }
 
     /// @notice Value of the torus invariant at the current point (≈0 on the surface).
@@ -561,39 +641,37 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     /// @notice Raw output for a raw input, fee included.
     function quoteExactInput(address tokenIn, address tokenOut, uint256 rawIn) external view returns (uint256 rawOut) {
         (uint8 i, uint8 j) = _indices(tokenIn, tokenOut);
-        uint256 wadIn = rawIn * _scale[i];
-        (, uint256 wadOut,,) = _simulate(i, j, wadIn - wadIn * feePpm / FEE_DENOMINATOR, true);
-        return wadOut / _scale[j];
+        (, rawOut,,,) = _price(i, j, true, rawIn);
     }
 
     /// @notice Raw input needed for a raw output, fee included.
     function quoteExactOutput(address tokenIn, address tokenOut, uint256 rawOut) external view returns (uint256 rawIn) {
         (uint8 i, uint8 j) = _indices(tokenIn, tokenOut);
-        (uint256 wadNet,,,) = _simulate(i, j, rawOut * _scale[j], false);
-        uint256 wadGross = OrbitalMath.ceilDiv(wadNet * FEE_DENOMINATOR, FEE_DENOMINATOR - feePpm);
-        rawIn = OrbitalMath.ceilDiv(wadGross, _scale[i]);
-        if (rawIn == 0) rawIn = 1;
+        (rawIn,,,,) = _price(i, j, false, rawOut);
     }
 
     /// @notice Raw deposit required per token to add `radius` at `l` right now.
     function previewDeposit(uint256 l, uint256 radius) external view returns (uint256[] memory amounts) {
-        Level[] memory lv = _loadLevels();
-        (uint256[] memory virt,) = _levelVector(lv, l, radius);
-        amounts = new uint256[](n);
-        for (uint256 k = 0; k < n; k++) {
-            uint256 floorK = radius * lv[l].xMinNorm / WAD;
-            amounts[k] = OrbitalMath.ceilDiv(virt[k] > floorK ? virt[k] - floorK : 0, _scale[k]);
-        }
+        (, amounts,) = _depositAmounts(_loadLevels(), l, radius);
     }
 
     /// @notice Fees claimable right now by `lp` in `l`, raw units.
     function pendingFees(uint256 l, address lp) external view returns (uint256[] memory amounts) {
+        (amounts,) = _owed(l, lp);
+    }
+
+    /// @dev Virtual vector, raw deposit per token (virtual minus the tick's floor, rounded up) and
+    /// boundary status for adding `radius` at `l` now.
+    function _depositAmounts(Level[] memory lv, uint256 l, uint256 radius)
+        internal
+        view
+        returns (uint256[] memory virt, uint256[] memory amounts, bool boundary)
+    {
+        (virt, boundary) = _levelVector(lv, l, radius, true);
         amounts = new uint256[](n);
-        uint256 radius = positions[l][lp];
+        uint256 floorK = radius * lv[l].xMinNorm / WAD;
         for (uint256 k = 0; k < n; k++) {
-            uint256 growth = _feeGrowth[k];
-            uint256 debt = _feeDebt[l][lp][k];
-            if (radius > 0 && growth > debt) amounts[k] = radius * (growth - debt) / WAD / _scale[k];
+            amounts[k] = OrbitalMath.ceilDiv(virt[k] > floorK ? virt[k] - floorK : 0, _scale[k]);
         }
     }
 
@@ -640,66 +718,133 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         }
     }
 
+    /// @dev Normalised interior position under `mask`. When no interior liquidity is left the
+    /// interior sits (by definition) on the plane of the highest pinned tick: that is the only
+    /// position consistent with every pinned tick staying pinned.
+    function _position(Level[] memory lv, uint256 mask, uint256 s, OrbitalMath.Consolidated memory c)
+        internal
+        view
+        returns (int256)
+    {
+        if (c.r > 0) return OrbitalMath.alphaIntNorm(s, sqrtN, c);
+        (bool found, uint256 top) = _topPinned(lv, mask);
+        return found ? int256(lv[top].kNorm) : type(int256).max;
+    }
+
+    /// @dev Highest-plane pinned tick holding liquidity.
+    function _topPinned(Level[] memory lv, uint256 mask) internal pure returns (bool found, uint256 top) {
+        for (uint256 l = 0; l < lv.length; l++) {
+            if (lv[l].radius == 0 || mask & (1 << l) == 0) continue;
+            found = true;
+            top = l; // levels are ascending in kNorm
+        }
+    }
+
     /// @dev Virtual reserve vector for `radius` of tick `l` at the current point. For an empty
     /// level the tick's status is derived from the interior position.
-    function _levelVector(Level[] memory lv, uint256 l, uint256 radius)
+    ///
+    /// A deposit (`incoming`) is priced on the tick's own surface: a boundary tick on its circle,
+    /// an interior tick on the sphere through the interior's current direction. A state point that
+    /// sits off the torus by some dust is therefore never copied in proportion to the new radius.
+    /// A withdrawal takes the tick's proportional share of what the interior actually holds, so it
+    /// can never pay out more than the pool's accounting backs.
+    function _levelVector(Level[] memory lv, uint256 l, uint256 radius, bool incoming)
         internal
         view
         returns (uint256[] memory v, bool boundary)
     {
-        v = new uint256[](n);
         if (totalRadius == 0) {
-            // First deposit opens the pool at the equal-price point, xᵢ = r(1 − 1/√N), computed so
-            // that the fixed-point invariant is ≥ 0 (the pool never starts with skimmable excess):
-            // S ≤ (r·√N − r)·√N  ⇔  α ≤ r·√N − r.
-            uint256 each = (radius * sqrtN / WAD - radius) * sqrtN / WAD / n;
-            for (uint256 k = 0; k < n; k++) {
-                v[k] = each;
-            }
-            return (v, false);
+            // First deposit opens the pool at the equal-price point, xᵢ = r(1 − 1/√N).
+            return (_equalPoint(radius), false);
         }
 
         OrbitalMath.Consolidated memory c = _consolidate(lv, boundaryMask);
         (uint256 s, uint256 q) = _sums(_x);
+        uint256 w = OrbitalMath.wNorm(s, q, n);
 
         if (lv[l].radius > 0) {
             boundary = boundaryMask & (1 << l) != 0;
         } else {
-            if (c.r == 0) revert NoInteriorLiquidity();
-            boundary = OrbitalMath.alphaIntNorm(s, sqrtN, c) > int256(lv[l].kNorm);
+            boundary = _position(lv, boundaryMask, s, c) > int256(lv[l].kNorm);
         }
-        if (!boundary && c.r == 0) revert NoInteriorLiquidity();
 
-        uint256 w = OrbitalMath.wNorm(s, q, n);
+        if (boundary) return (_circlePoint(lv[l].kNorm, lv[l].sNorm, s, w, radius), true);
+        if (c.r == 0) {
+            // Only pinned liquidity is left: a new interior opens on the highest pinned plane,
+            // where the pinned ticks and the fresh sphere share one point and one direction.
+            if (!incoming) revert NoInteriorLiquidity();
+            (, uint256 top) = _topPinned(lv, boundaryMask);
+            return (_circlePoint(lv[top].kNorm, lv[top].sNorm, s, w, radius), false);
+        }
+        return (_interiorPoint(c, s, w, radius, incoming), false);
+    }
+
+    /// @dev xᵢ = r(1 − 1/√N) for every coin, rounded up by at most ~r/N·1e-18 so the opening point
+    /// is never outside the sphere: a later on-sphere deposit followed by a proportional withdrawal
+    /// can then never return more than was put in. (The sub-raw-unit excess this leaves is dust.)
+    function _equalPoint(uint256 radius) internal view returns (uint256[] memory v) {
+        v = new uint256[](n);
+        uint256 each = radius - radius * WAD / (sqrtN + 1); // sqrtN is floored, so this is ≥ exact
         for (uint256 k = 0; k < n; k++) {
-            v[k] = _tokenShare(lv[l], c, s, w, radius, boundary, k);
+            v[k] = each;
         }
     }
 
-    /// @dev Token `k`'s virtual reserve for `radius` of a tick, given the shared direction ŵ.
-    function _tokenShare(
-        Level memory L,
-        OrbitalMath.Consolidated memory c,
-        uint256 s,
-        uint256 w,
-        uint256 radius,
-        bool boundary,
-        uint256 k
-    ) internal view returns (uint256) {
-        int256 dir = 0; // ŵ_k in WAD
-        if (w != 0) dir = (int256(_x[k]) - int256(s / n)) * int256(WAD) / int256(w);
-        int256 val;
-        if (boundary) {
-            // x = k·v + s·ŵ for this tick alone
-            val = int256(L.kNorm * radius / WAD * WAD / sqrtN) + int256(L.sNorm * radius / WAD) * dir / int256(WAD);
-        } else {
-            // interior share of (x − x_bound)
-            int256 xBound = int256(c.kb * WAD / sqrtN) + int256(c.sb) * dir / int256(WAD);
-            val = int256(_x[k]) - xBound;
-            if (val < 0) val = 0;
-            return uint256(val) * radius / c.r;
+    /// @dev Point of a tick of `radius` pinned to plane `kNorm`: x = k·v/√N·… + s·ŵ, with ŵ the
+    /// pool's current direction. Each coordinate rounds down (pool-favoured) at wei precision.
+    function _circlePoint(uint256 kNorm, uint256 sNorm, uint256 s, uint256 w, uint256 radius)
+        internal
+        view
+        returns (uint256[] memory v)
+    {
+        v = new uint256[](n);
+        int256 along = int256(kNorm * radius / sqrtN); // k·r/√N per coin
+        int256 sr = int256(sNorm * radius / WAD);
+        for (uint256 k = 0; k < n; k++) {
+            int256 val = along;
+            if (w != 0) val += _floorDiv((int256(_x[k]) - int256(s / n)) * sr, int256(w));
+            v[k] = val > 0 ? uint256(val) : 0;
         }
-        return val > 0 ? uint256(val) : 0;
+    }
+
+    /// @dev Point of an interior tick of `radius`. `projected`: the current interior reserve vector
+    /// (x − x_bound) projected onto the sphere of radius r_int, then scaled to `radius`, so that if
+    /// the pool's point sits inside or outside the surface by some dust the new position still lands
+    /// exactly on its own sphere. Otherwise the proportional share (x − x_bound)·radius/r_int.
+    function _interiorPoint(OrbitalMath.Consolidated memory c, uint256 s, uint256 w, uint256 radius, bool projected)
+        internal
+        view
+        returns (uint256[] memory v)
+    {
+        int256[] memory u = new int256[](n); // interior reserve (minus the sphere centre if projected)
+        uint256 uu;
+        for (uint256 k = 0; k < n; k++) {
+            int256 xBound = int256(c.kb * WAD / sqrtN);
+            if (w != 0) xBound += _floorDiv((int256(_x[k]) - int256(s / n)) * int256(c.sb), int256(w));
+            u[k] = int256(_x[k]) - xBound;
+            if (projected) {
+                u[k] -= int256(c.r);
+                uu += uint256(u[k] * u[k]);
+            }
+        }
+        v = new uint256[](n);
+        if (!projected) {
+            for (uint256 k = 0; k < n; k++) {
+                v[k] = u[k] > 0 ? uint256(u[k]) * radius / c.r : 0;
+            }
+            return v;
+        }
+        uint256 uNorm = OrbitalMath.sqrt(uu);
+        if (uNorm == 0) return _equalPoint(radius);
+        for (uint256 k = 0; k < n; k++) {
+            int256 val = int256(radius) + _floorDiv(u[k] * int256(radius), int256(uNorm));
+            v[k] = val > 0 ? uint256(val) : 0;
+        }
+    }
+
+    function _floorDiv(int256 a, int256 b) internal pure returns (int256 q) {
+        q = a / b;
+        if ((a % b != 0) && ((a < 0) != (b < 0))) q -= 1;
     }
 
     struct Trade {
@@ -733,7 +878,9 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
             lv: _loadLevels()
         });
 
-        for (uint256 iter = 0; iter <= 2 * t.lv.length; iter++) {
+        // Each tick can leave the interior at most once (while α falls) and rejoin it at most once
+        // (while α rises) per trade, plus one final segment.
+        for (uint256 iter = 0; iter <= 2 * t.lv.length + 1; iter++) {
             if (_step(t)) return (t.amountIn, t.amountOut, t.x, t.mask);
         }
         revert TooManyCrossings();
@@ -741,19 +888,58 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
 
     /// @dev One segment of a trade under the current consolidation. Returns true when the trade
     /// is complete; false when it stopped at a tick boundary and flipped that tick.
+    ///
+    /// α falls while xᵢ < xⱼ (the trade heads back towards the peg) and rises afterwards, so a
+    /// segment is examined in that order: first the pinned tick nearest below the interior, which
+    /// must rejoin the interior where the falling path meets its plane; then the interior tick
+    /// nearest above, which pins where the rising path meets its plane. A tick whose recorded
+    /// status already disagrees with the interior position (one-unit rounding after a deposit or
+    /// withdrawal, or a state left exactly on a plane) is flipped where the trade stands.
     function _step(Trade memory t) internal view returns (bool done) {
         OrbitalMath.Consolidated memory c = _consolidate(t.lv, t.mask);
         if (c.r == 0) revert NoInteriorLiquidity();
-        (uint256 s, uint256 q) = _sums(t.x);
-        uint256 realJ;
-        {
-            uint256 floorAll = _virtualFloor(t.lv);
-            realJ = t.x[t.j] > floorAll ? t.x[t.j] - floorAll : 0;
-        }
-        OrbitalMath.Pair memory p = OrbitalMath.Pair({xi: t.x[t.i], xj: t.x[t.j], s: s, q: q});
+        OrbitalMath.Pair memory p = _pair(t);
+        uint256 realJ = _realOut(t);
 
-        uint256 dIn;
-        uint256 dOut;
+        // (a) Towards the peg (α falling while xᵢ < xⱼ): the highest pinned tick is the first
+        //     whose plane the path can meet, and it rejoins the interior there.
+        if (p.xi < p.xj) {
+            (bool found, uint256 l) = _topPinned(t.lv, t.mask);
+            if (found && _tryFlip(t, p, c, realJ, l, false)) return false;
+        }
+
+        (uint256 dIn, uint256 dOut) = _solveSegment(t, p, c, realJ);
+
+        // (b) Away from the peg: the lowest interior tick whose plane lies at or below the
+        //     segment's end pins where the rising path meets it.
+        {
+            (bool found, uint256 l) =
+                _lowestInteriorBelow(t.lv, t.mask, OrbitalMath.alphaIntNorm(p.s + dIn - dOut, sqrtN, c));
+            if (found && _tryFlip(t, p, c, realJ, l, true)) return false;
+        }
+
+        _apply(t, dIn, dOut);
+        _checkFinal(t.x, t.i, c);
+        return true;
+    }
+
+    function _pair(Trade memory t) internal pure returns (OrbitalMath.Pair memory p) {
+        (uint256 s, uint256 q) = _sums(t.x);
+        return OrbitalMath.Pair({xi: t.x[t.i], xj: t.x[t.j], s: s, q: q});
+    }
+
+    /// @dev Real (deposited) reserve of the output token: what a trade may take at most.
+    function _realOut(Trade memory t) internal pure returns (uint256) {
+        uint256 floorAll = _virtualFloor(t.lv);
+        return t.x[t.j] > floorAll ? t.x[t.j] - floorAll : 0;
+    }
+
+    /// @dev Prices the whole remaining trade under consolidation `c`.
+    function _solveSegment(Trade memory t, OrbitalMath.Pair memory p, OrbitalMath.Consolidated memory c, uint256 realJ)
+        internal
+        view
+        returns (uint256 dIn, uint256 dOut)
+    {
         if (t.exactIn) {
             dIn = t.remaining;
             dOut = OrbitalMath.solveOut(p, dIn, realJ, n, sqrtN, c);
@@ -762,36 +948,58 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
             dOut = t.remaining;
             dIn = OrbitalMath.solveIn(p, dOut, c.r + c.kb + c.sb, n, sqrtN, c);
         }
+    }
 
-        (bool found, uint256 l) = _nextCrossing(
-            t.lv, t.mask, OrbitalMath.alphaIntNorm(s, sqrtN, c), OrbitalMath.alphaIntNorm(s + dIn - dOut, sqrtN, c)
-        );
-        if (found) {
-            (uint256 tIn, uint256 d1) = _toPlane(t.lv[l], p, c);
-            if (t.exactIn ? tIn < t.remaining : d1 < t.remaining) {
-                if (d1 > realJ) revert OrbitalMath.InsufficientLiquidity();
-                _apply(t, tIn, d1);
-                t.mask ^= (1 << l);
-                return false;
-            }
+    /// @dev Flips tick `l` where the path meets its plane within the trade: `pin = false` unpins it
+    /// on the j-heavy image (met while α falls), `pin = true` pins it on the i-heavy image (met
+    /// while α rises). A tick whose plane the interior already sits on, or beyond, within
+    /// `POSITION_TOLERANCE` is flipped where the trade stands (pinning only while rising). A plane
+    /// step counts only when it makes progress and ends short of the trade. Returns true if flipped.
+    function _tryFlip(
+        Trade memory t,
+        OrbitalMath.Pair memory p,
+        OrbitalMath.Consolidated memory c,
+        uint256 realJ,
+        uint256 l,
+        bool pin
+    ) internal view returns (bool) {
+        int256 gap = int256(t.lv[l].kNorm) - OrbitalMath.alphaIntNorm(p.s, sqrtN, c); // plane − position
+        bool atPlane = pin ? (p.xi >= p.xj && gap <= POSITION_TOLERANCE) : (gap + POSITION_TOLERANCE >= 0);
+        if (!atPlane) {
+            (bool ok, uint256 tIn, uint256 d1) = _toPlane(t.lv[l], p, c, pin);
+            if (!ok || tIn == 0 || (t.exactIn ? tIn >= t.remaining : d1 >= t.remaining)) return false;
+            if (d1 > realJ) revert OrbitalMath.InsufficientLiquidity();
+            _apply(t, tIn, d1);
         }
-
-        _apply(t, dIn, dOut);
-        _checkPole(t.x, t.i, c);
+        t.mask = pin ? t.mask | (1 << l) : t.mask & ~(1 << l);
         return true;
     }
 
-    /// @dev Input/output that lands exactly on tick `L`'s plane from `p` under consolidation `c`.
-    function _toPlane(Level memory L, OrbitalMath.Pair memory p, OrbitalMath.Consolidated memory c)
+    /// @dev Lowest interior tick (holding liquidity) whose plane is at or below `aAfter`.
+    function _lowestInteriorBelow(Level[] memory lv, uint256 mask, int256 aAfter)
+        internal
+        pure
+        returns (bool found, uint256 best)
+    {
+        for (uint256 l = 0; l < lv.length; l++) {
+            if (lv[l].radius == 0 || mask & (1 << l) != 0) continue;
+            if (int256(lv[l].kNorm) <= aAfter) return (true, l); // ascending in kNorm
+        }
+    }
+
+    /// @dev Input/output that lands exactly on tick `L`'s plane from `p` under consolidation `c`,
+    /// on the j-heavy image (`iHeavy = false`, met while α falls) or the i-heavy one (met while it
+    /// rises). `ok` is false when the path does not reach that image ahead of `p`.
+    function _toPlane(Level memory L, OrbitalMath.Pair memory p, OrbitalMath.Consolidated memory c, bool iHeavy)
         internal
         view
-        returns (uint256 tIn, uint256 dOut)
+        returns (bool ok, uint256 tIn, uint256 dOut)
     {
         uint256 alphaT = L.kNorm * c.r / WAD + c.kb;
         uint256 sT = alphaT * sqrtN / WAD;
         uint256 wT = c.sb + c.r * L.sNorm / WAD;
         uint256 qT = wT * wT + sT * sT / n;
-        return OrbitalMath.planeStep(p, sT, qT);
+        return OrbitalMath.tryPlaneStep(p, sT, qT, iHeavy);
     }
 
     function _apply(Trade memory t, uint256 dIn, uint256 dOut) internal pure {
@@ -802,42 +1010,18 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         t.remaining -= t.exactIn ? dIn : dOut;
     }
 
-    /// @dev The next tick the interior position crosses moving from `aNow` to `aAfter`.
-    function _nextCrossing(Level[] memory lv, uint256 mask, int256 aNow, int256 aAfter)
-        internal
-        pure
-        returns (bool found, uint256 best)
-    {
-        if (aAfter > aNow) {
-            // Leaving the peg: interior ticks pin to their planes, nearest first.
-            for (uint256 l = 0; l < lv.length; l++) {
-                if (lv[l].radius == 0 || mask & (1 << l) != 0) continue;
-                int256 k = int256(lv[l].kNorm);
-                if (k >= aNow && k <= aAfter && (!found || k < int256(lv[best].kNorm))) {
-                    found = true;
-                    best = l;
-                }
-            }
-        } else if (aAfter < aNow) {
-            // Returning to the peg: boundary ticks rejoin the interior, nearest first.
-            for (uint256 l = 0; l < lv.length; l++) {
-                if (lv[l].radius == 0 || mask & (1 << l) == 0) continue;
-                int256 k = int256(lv[l].kNorm);
-                if (k >= aAfter && k <= aNow && (!found || k > int256(lv[best].kNorm))) {
-                    found = true;
-                    best = l;
-                }
-            }
-        }
-    }
-
-    /// @dev A trade may not push a token's interior reserve past the sphere's pole (price ≤ 0).
-    function _checkPole(uint256[] memory x, uint8 i, OrbitalMath.Consolidated memory c) internal view {
+    /// @dev End-of-trade checks. (1) On every valid state the pool's ‖w‖ covers the pinned ticks'
+    /// circle radii (the interior contributes a non-negative multiple of the shared direction); a
+    /// trade ending with ‖w‖ below s_bound has gone through the interior's equal-price point with a
+    /// tick still pinned, which the crossing logic prevents — refuse it rather than commit an
+    /// inverted state. (2) A trade may not push a token's interior reserve past the sphere's pole
+    /// (price ≤ 0).
+    function _checkFinal(uint256[] memory x, uint8 i, OrbitalMath.Consolidated memory c) internal view {
         (uint256 s, uint256 q) = _sums(x);
         uint256 w = OrbitalMath.wNorm(s, q, n);
-        int256 wi = int256(x[i]) - int256(s / n);
+        if (w < c.sb) revert BoundaryInverted();
         int256 xBound = int256(c.kb * WAD / sqrtN);
-        if (w != 0) xBound += int256(c.sb) * wi / int256(w);
+        if (w != 0) xBound += int256(c.sb) * (int256(x[i]) - int256(s / n)) / int256(w);
         if (int256(x[i]) - xBound > int256(c.r)) revert SwapTooLarge();
     }
 

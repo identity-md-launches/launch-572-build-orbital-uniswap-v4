@@ -12,7 +12,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
@@ -69,7 +69,11 @@ contract OrbitalHookTest is OrbitalFixture {
         // Unimplemented callbacks refuse too, even from the manager.
         vm.prank(address(manager));
         vm.expectRevert(BaseHook.HookNotImplemented.selector);
-        hook.afterInitialize(address(this), keyAB, SQRT_PRICE_1_1, 0);
+        IHooks(address(hook)).afterInitialize(address(this), keyAB, SQRT_PRICE_1_1, 0);
+        vm.prank(address(manager));
+        vm.expectRevert(BaseHook.HookNotImplemented.selector);
+        IHooks(address(hook))
+            .afterSwap(address(this), keyAB, SwapParams(true, -1e18, SQRT_PRICE_1_1 / 2), toBalanceDelta(0, 0), "");
     }
 
     function test_initializeRegistersOrbitalPairs() public view {
