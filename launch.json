@@ -1,0 +1,34 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "OrbitalHook",
+    "constructorArgs": [
+      "$poolManager",
+      "0x0000000000000000000000000000000000000000",
+      "0x0000000000000000000000000000000000000000",
+      "0",
+      "0",
+      "0",
+      "400"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeAddLiquidity",
+      "beforeSwap",
+      "beforeSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "OrbitalToken",
+    "name": "Orbital",
+    "symbol": "ORB",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Technical description of the accepted tree; it sets no deployment policy. Supply, allocations, owners and chain come from the launch policy.\n\nTOKEN: OrbitalToken (src/OrbitalToken.sol), self-contained ERC-20, name Orbital, symbol ORB, 18 decimals. Zero-argument constructor mints exactly 1,000,000,000 ORB (10^27 minor units) once to msg.sender. No owner, mint, burn, pause, blocklist, fee, proxy or selfdestruct. ORB is not a basket coin: any ORB pool under the hook is pass-through, with the pause as its only hook behaviour.\n\nHOOK: OrbitalHook (src/OrbitalHook.sol) on the repo's own BaseHook; solc 0.8.26, evm cancun, optimizer 200 runs, no via_ir, bytecode_hash none. getHookPermissions returns exactly beforeInitialize, beforeAddLiquidity, beforeSwap and beforeSwapReturnDelta (address flags 0x2888 = 10376); afterInitialize and the other nine flags are false. Every callback is PoolManager-only; unimplemented ones revert HookNotImplemented. beforeInitialize reverts IsPaused while paused, registers the pool as an Orbital pair when both currencies are basket coins, otherwise leaves it pass-through, and returns its selector. beforeAddLiquidity reverts LiquidityLivesInHook on Orbital pairs only. beforeSwap reverts IsPaused on every pool while paused; on Orbital pairs it prices the whole specified amount on the N-sphere (Paradigm Orbital: consolidated interior ticks, boundary ticks pinned at their plane, fee feePpm on input, reserves held as ERC-6909 claims) and returns a BeforeSwapDelta; pass-through pools use v4's own curve. Owner may pause, unpause, setGuardian, setFee (max 10,000 ppm) and transferOwnership; guardian may only guardianPause. Nobody can move LP funds; withdraw and collectFees work while paused. Breaker: OrbitalDepegReactive (Reactive Lasna) watches a Chainlink AnswerUpdated feed and sends a Callback to Unichain Sepolia (1301), where the Reactive proxy invokes OrbitalDepegCallback, deployed after the hook and set as guardian by the owner. Neither breaker contract is in this manifest.\n\nCONSTRUCTOR, declaration order: (IPoolManager, address owner, address guardian, address[] basket, uint8[] decimals, uint256[] kNorms, uint24 feePpm). Argument 0 is $poolManager. Argument 2 (guardian) is legitimately zero: the callback needs the hook address, so it is wired later by setGuardian. Argument 6 is 400 (0.04%, the tested fee). The constructor makes no external calls and requires owner nonzero, 2..8 distinct nonzero basket tokens with decimals <= 18, 1..8 ascending kNorms in (sqrtN-1, (N-1)/sqrtN], fee <= 1%.\n\nBLOCKING GAP, NOT RESOLVABLE HERE: a univ4_hook manifest carries only $poolManager, a literal address or an integer per argument (a '$token' entry was refused on this network for that reason) and no $owner. Arguments 3, 4 and 5 are dynamic arrays and cannot be expressed; the 0 written there is a placeholder no ABI encoder accepts, so the deployer fails safely instead of deploying a mis-configured hook. Argument 1 is zero because naming a privileged wallet is forbidden; the constructor then reverts ZeroAddress, so the protected Hook floor, which deploys the attested creation code with these baked-in arguments, reports 'hook deployment reverted'. Intended values: owner = the policy owner; basket = Circle USDC on Unichain Sepolia 0x31d0220469e10c4E71834a79b1f276d740d3768F (decimals 6, confirmed by RPC on 2026-10-01) plus further verified stablecoins; kNorms per the README (N=3 tests use 0.74e18, 0.95e18, 1.15e18). Fix: deployer support for array arguments and $owner, or a hook revision taking basket and ticks after construction.\n\nPOOL: currency0 native ETH (zero address), currency1 ORB, static LP fee 3000 (0.3%), tickSpacing 60: a pass-through pool. initialPrice 79228162514264337593543950336 is 2^96 (1 ORB per ETH, tick 0, the tests' price); the hook constrains neither price nor fee. The hook address is CREATE2-mined for flags 0x2888.\n\nLocal checks: forge build and forge test (62 tests, incl. fuzz) pass."
+}
