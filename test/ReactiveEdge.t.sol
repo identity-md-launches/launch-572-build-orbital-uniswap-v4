@@ -101,7 +101,8 @@ contract ReactiveEdgeTest is OrbitalFixture {
         callback.transferOwnership(owner);
         vm.prank(owner);
         hook.setGuardian(address(callback));
-        reactive = new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
+        reactive =
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, 0);
         vm.deal(address(callback), 1 ether);
         depositAs(lp, WIDE, 1_000_000e18);
     }
@@ -127,9 +128,20 @@ contract ReactiveEdgeTest is OrbitalFixture {
         internal
         returns (bytes memory payload, bool emitted)
     {
+        return reactAs(r, feed, price, roundId);
+    }
+
+    /// @dev Feeds one `AnswerUpdated` log from `emitter` to the ReactVM copy and returns the last
+    /// `Callback` payload it emitted, if any.
+    function reactAs(OrbitalDepegReactive r, address emitter, int256 price, uint256 roundId)
+        internal
+        returns (bytes memory payload, bool emitted)
+    {
+        IReactive.LogRecord memory rec = logRecord(price, roundId);
+        rec._contract = emitter;
         vm.recordLogs();
         vm.prank(SERVICE);
-        r.react(logRecord(price, roundId));
+        r.react(rec);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 sig = keccak256("Callback(uint256,address,uint64,bytes)");
         for (uint256 i = 0; i < logs.length; i++) {
@@ -151,7 +163,7 @@ contract ReactiveEdgeTest is OrbitalFixture {
     function test_networkCopySubscribesToTheFeedInItsConstructor() public {
         MockSystemContract sys = etchSystemContract();
         OrbitalDepegReactive net =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, 0);
         assertFalse(net.isReactVm(), "sees the system contract: network copy");
         assertEq(sys.subscribes(), 1, "subscribed once");
         assertEq(sys.lastCaller(), address(net));
@@ -168,7 +180,7 @@ contract ReactiveEdgeTest is OrbitalFixture {
     function test_networkCopySubscriptionManagementIsOwnerOnly() public {
         MockSystemContract sys = etchSystemContract();
         OrbitalDepegReactive net =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, 0);
         vm.prank(trader);
         vm.expectRevert(OrbitalDepegReactive.NotOwner.selector);
         net.unsubscribe();
@@ -199,7 +211,7 @@ contract ReactiveEdgeTest is OrbitalFixture {
         bandBps = bound(bandBps, 0, 9_999);
         delta = bound(delta, 0, PEG - 1);
         OrbitalDepegReactive r =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, bandBps);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, bandBps, 0);
         assertFalse(r.isOutOfBand(PEG), "the peg itself is always in band");
         assertEq(r.isOutOfBand(PEG - delta), r.isOutOfBand(PEG + delta), "band is symmetric around the peg");
         // Monotone: anything further from the peg than an out-of-band price is out of band too.
@@ -218,7 +230,7 @@ contract ReactiveEdgeTest is OrbitalFixture {
         bandBps = bound(bandBps, 0, 9_999);
         price = bound(price, type(int256).min, 0);
         OrbitalDepegReactive r =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, bandBps);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, bandBps, 0);
         assertTrue(r.isOutOfBand(price));
         // Delivered as a topic, a negative answer is a huge uint; the contract must still trip.
         (, bool emitted) = reactAndCapture(r, price, 9);
@@ -226,7 +238,8 @@ contract ReactiveEdgeTest is OrbitalFixture {
     }
 
     function test_zeroBandTripsOnAnyDeviation() public {
-        OrbitalDepegReactive r = new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 0);
+        OrbitalDepegReactive r =
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 0, 0);
         assertFalse(r.isOutOfBand(PEG));
         assertTrue(r.isOutOfBand(PEG + 1));
         assertTrue(r.isOutOfBand(PEG - 1));
@@ -234,7 +247,7 @@ contract ReactiveEdgeTest is OrbitalFixture {
 
     function test_widestBandStillTripsOnCollapse() public {
         OrbitalDepegReactive r =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 9_999);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 9_999, 0);
         // 1e8·(1 − 0.9999) = 1e4 is the lowest in-band price; anything under it trips.
         assertFalse(r.isOutOfBand(10_000));
         assertTrue(r.isOutOfBand(9_999));
@@ -246,11 +259,11 @@ contract ReactiveEdgeTest is OrbitalFixture {
 
     function test_constructorRejectsNonPositivePegAndZeroCallback() public {
         vm.expectRevert(OrbitalDepegReactive.InvalidConfig.selector);
-        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(0), 1, PEG, BAND_BPS);
+        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(0), 1, PEG, BAND_BPS, 0);
         vm.expectRevert(OrbitalDepegReactive.InvalidConfig.selector);
-        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, -1, BAND_BPS);
+        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, -1, BAND_BPS, 0);
         vm.expectRevert(OrbitalDepegReactive.InvalidConfig.selector);
-        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 10_001);
+        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 10_001, 0);
     }
 
     // ---- payload shape -----------------------------------------------------------------------
@@ -335,16 +348,18 @@ contract ReactiveEdgeTest is OrbitalFixture {
         assertTrue(hook.paused(), "a newer out-of-band round pauses again");
     }
 
-    /// The reactive side latches on the first out-of-band round and requests exactly one callback
-    /// per excursion. If that one delivery fails on the destination (here: the callback is not yet
-    /// bound to a hook; a wrong RVM id, an unset guardian or an unfunded callback behave the same),
-    /// nothing retries it: every later round of the same excursion is only `DepegPersists`, and the
-    /// pool stays open until a human pauses it or the price returns in band and leaves again.
-    /// Reported in the findings file as a liveness gap of the keeper-free design.
+    /// With `retryEveryRounds = 0` the reactive side latches on the first out-of-band round and
+    /// requests exactly one callback per excursion. If that one delivery fails on the destination
+    /// (here: the callback is not yet bound to a hook; a wrong RVM id, an unset guardian or an
+    /// unfunded callback behave the same), nothing retries it: every later round of the same
+    /// excursion is only `DepegPersists`, and the pool stays open until a human pauses it or the
+    /// price returns in band and leaves again. This was reported as a liveness gap of the
+    /// keeper-free design; the revision answered it with the `retryEveryRounds` setting (tests
+    /// below), and this is the documented behaviour of leaving that setting at zero.
     function test_failedDeliveryIsNotRetriedWithinTheExcursion() public {
         OrbitalDepegCallback unbound = new OrbitalDepegCallback(address(proxy), address(0), rvmId);
         OrbitalDepegReactive r =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(unbound), 500_000, PEG, BAND_BPS);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(unbound), 500_000, PEG, BAND_BPS, 0);
         vm.prank(owner);
         hook.setGuardian(address(unbound));
 
@@ -502,5 +517,164 @@ contract ReactiveEdgeTest is OrbitalFixture {
         vm.prank(SERVICE);
         vm.expectRevert(OrbitalDepegReactive.UnexpectedLog.selector);
         reactive.react(rec);
+    }
+
+    // ---- retries: the revision's answer to the lost-delivery gap -----------------------------
+
+    function withRetries(uint32 every) internal returns (OrbitalDepegReactive r) {
+        r = new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, every);
+        assertEq(r.retryEveryRounds(), every);
+    }
+
+    /// `retryEveryRounds = 1` is the most expensive setting: every out-of-band round of a tripped
+    /// excursion requests (and pays for) a callback, each acknowledged on the destination.
+    function test_retryEveryRoundRequestsACallbackOnEveryOutOfBandRound() public {
+        OrbitalDepegReactive r = withRetries(1);
+        (bytes memory payload, bool emitted) = reactAndCapture(r, 0.5e8, 1);
+        assertTrue(emitted);
+        (bool ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused());
+        for (uint256 round = 2; round <= 5; round++) {
+            vm.expectEmit(true, false, false, true, address(r));
+            emit OrbitalDepegReactive.DepegRetried(feed, 0.5e8, round);
+            (payload, emitted) = reactAndCapture(r, 0.5e8, round);
+            assertTrue(emitted, "one callback per round");
+            assertEq(r.roundsSinceCallback(feed), 0, "counter resets on every retry");
+            vm.expectEmit(true, false, false, true, address(callback));
+            emit OrbitalDepegCallback.DepegAlreadyPaused(feed, 0.5e8, round);
+            (ok,) = proxy.deliver(address(callback), payload, rvmId);
+            assertTrue(ok, "a retry that finds the hook paused is acknowledged, not failed");
+        }
+        assertEq(callback.lastRoundId(feed), 5);
+    }
+
+    /// With retries on, an owner's `unpause()` during a sustained depeg is undone by the next retry
+    /// (the README says so: the breaker only ever pauses, and a retry pauses again). The documented
+    /// way to keep the pool open on purpose is to silence the breaker first; both documented
+    /// switches make the retry's delivery fail without touching the hook, and restoring either one
+    /// lets the following retry land.
+    function test_retryRePausesAfterOwnerResumeUnlessTheBreakerIsSilenced() public {
+        OrbitalDepegReactive r = withRetries(2);
+        (bytes memory payload,) = reactAndCapture(r, 0.5e8, 1);
+        (bool ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused());
+
+        vm.prank(owner);
+        hook.unpause();
+        (, bool emitted) = reactAndCapture(r, 0.5e8, 2);
+        assertFalse(emitted, "round 2 only persists");
+        assertFalse(hook.paused(), "the resume holds until the next retry");
+        (payload, emitted) = reactAndCapture(r, 0.5e8, 3);
+        assertTrue(emitted, "round 3 retries");
+        (ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused(), "the retry pauses the pool again after an owner resume");
+
+        // Silence 1: no guardian. The retry's delivery reverts inside the hook; nothing is recorded,
+        // so the round is not burnt as "acted on".
+        vm.startPrank(owner);
+        hook.unpause();
+        hook.setGuardian(address(0));
+        vm.stopPrank();
+        (, emitted) = reactAndCapture(r, 0.5e8, 4);
+        assertFalse(emitted);
+        (payload, emitted) = reactAndCapture(r, 0.5e8, 5);
+        assertTrue(emitted);
+        bytes memory ret;
+        (ok, ret) = proxy.deliver(address(callback), payload, rvmId);
+        assertFalse(ok, "silenced: the delivery fails");
+        assertEq(bytes4(ret), OrbitalHook.NotGuardian.selector);
+        assertFalse(hook.paused(), "the pool stays open");
+        assertEq(callback.lastRoundId(feed), 3, "a failed delivery records nothing");
+
+        // Silence 2: RVM id cleared on the callback contract, guardian restored.
+        vm.prank(owner);
+        hook.setGuardian(address(callback));
+        vm.prank(owner);
+        callback.setRvmId(address(0));
+        (, emitted) = reactAndCapture(r, 0.5e8, 6);
+        (payload, emitted) = reactAndCapture(r, 0.5e8, 7);
+        assertTrue(emitted);
+        (ok, ret) = proxy.deliver(address(callback), payload, rvmId);
+        assertFalse(ok);
+        assertEq(bytes4(ret), OrbitalDepegCallback.WrongRvmId.selector);
+        assertFalse(hook.paused());
+
+        // Restored: the next retry of the same excursion pauses again.
+        vm.prank(owner);
+        callback.setRvmId(rvmId);
+        (, emitted) = reactAndCapture(r, 0.5e8, 8);
+        (payload, emitted) = reactAndCapture(r, 0.5e8, 9);
+        assertTrue(emitted);
+        (ok,) = proxy.deliver(address(callback), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused());
+        assertEq(callback.lastRoundId(feed), 9);
+    }
+
+    /// Latches and retry counters are kept per emitting aggregator: one feed's retry or re-arm
+    /// never moves another feed's count.
+    function test_retryCountersArePerAggregator() public {
+        OrbitalDepegReactive r = withRetries(2);
+        address other = makeAddr("second-aggregator");
+        (, bool emitted) = reactAs(r, feed, 0.5e8, 1);
+        assertTrue(emitted);
+        (, emitted) = reactAs(r, feed, 0.5e8, 2);
+        assertFalse(emitted);
+        (, emitted) = reactAs(r, other, 0.5e8, 1);
+        assertTrue(emitted, "second feed trips on its own");
+        assertEq(r.roundsSinceCallback(feed), 1);
+        assertEq(r.roundsSinceCallback(other), 0);
+
+        (, emitted) = reactAs(r, feed, 0.5e8, 3);
+        assertTrue(emitted, "first feed retries");
+        assertEq(r.roundsSinceCallback(feed), 0);
+        assertEq(r.roundsSinceCallback(other), 0, "untouched by the first feed's retry");
+        (, emitted) = reactAs(r, other, 0.5e8, 2);
+        assertFalse(emitted, "second feed is one round into its interval");
+        assertEq(r.roundsSinceCallback(other), 1);
+
+        // Re-arming the first feed leaves the second feed's excursion where it was.
+        (, emitted) = reactAs(r, feed, 1e8, 4);
+        assertFalse(emitted);
+        assertFalse(r.tripped(feed));
+        assertTrue(r.tripped(other));
+        assertEq(r.roundsSinceCallback(other), 1);
+        (, emitted) = reactAs(r, other, 0.5e8, 3);
+        assertTrue(emitted, "second feed retries on schedule");
+    }
+
+    /// Cadence as a property: after the trip, `extra` further out-of-band rounds request exactly
+    /// `extra / every` callbacks (none when retries are off), the counter holds the remainder, and
+    /// an in-band round clears it so the next excursion starts a fresh interval.
+    /// forge-config: default.fuzz.runs = 300
+    function testFuzz_retryCadence(uint32 every, uint8 extra) public {
+        every = uint32(bound(every, 0, 24));
+        extra = uint8(bound(extra, 0, 60));
+        OrbitalDepegReactive r = withRetries(every);
+        (, bool emitted) = reactAndCapture(r, 0.5e8, 1);
+        assertTrue(emitted, "the first out-of-band round always trips");
+        uint256 retries;
+        for (uint256 k = 1; k <= extra; k++) {
+            (, emitted) = reactAndCapture(r, 0.5e8, 1 + k);
+            if (emitted) retries++;
+        }
+        assertEq(retries, every == 0 ? 0 : extra / every, "retries requested");
+        assertEq(r.roundsSinceCallback(feed), every == 0 ? 0 : extra % every, "counter holds the remainder");
+        assertTrue(r.tripped(feed));
+
+        (, emitted) = reactAndCapture(r, 1e8, 100);
+        assertFalse(emitted);
+        assertFalse(r.tripped(feed));
+        assertEq(r.roundsSinceCallback(feed), 0, "re-arm clears the counter");
+        (, emitted) = reactAndCapture(r, 0.5e8, 101);
+        assertTrue(emitted, "next excursion trips at once");
+        assertEq(r.roundsSinceCallback(feed), 0);
+        if (every > 1) {
+            (, emitted) = reactAndCapture(r, 0.5e8, 102);
+            assertFalse(emitted, "fresh interval");
+        }
     }
 }

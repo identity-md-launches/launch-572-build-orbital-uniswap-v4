@@ -177,6 +177,53 @@ contract OrbitalHandler is Test {
         minTotalRadius = radius;
     }
 
+    /// @dev Interior reserve of every coin, `u_k = x_k − k_bound/√N − s_bound·ŵ_k` (the hook's own
+    /// formula), and the interior radius.
+    function interior() public view returns (int256[] memory u, uint256 r) {
+        uint256 kb;
+        uint256 sb;
+        (r, kb, sb) = hook.consolidated();
+        uint256[] memory x = hook.reserves();
+        uint256 s;
+        uint256 q;
+        for (uint256 k = 0; k < x.length; k++) {
+            s += x[k];
+            q += x[k] * x[k];
+        }
+        uint256 w = OrbitalMath.sqrt(q > s * s / x.length ? q - s * s / x.length : 0);
+        u = new int256[](x.length);
+        for (uint256 k = 0; k < x.length; k++) {
+            int256 xb = int256(kb * 1e18 / hook.sqrtN());
+            if (w != 0) xb += int256(sb) * (int256(x[k]) - int256(s / x.length)) / int256(w);
+            u[k] = int256(x[k]) - xb;
+        }
+    }
+
+    /// @dev Marginal cost of one WAD of token j in WAD of token i at the current point, WAD-scaled:
+    /// (r − u_j)/(r − u_i), the ratio of the torus gradient's components. Zero when undefined (no
+    /// interior, or a coin at or past its pole).
+    function marginalPriceWad(uint8 i, uint8 j) public view returns (uint256) {
+        (int256[] memory u, uint256 r) = interior();
+        if (r == 0 || u[i] >= int256(r) || u[j] >= int256(r)) return 0;
+        return uint256(int256(r) - u[j]) * 1e18 / uint256(int256(r) - u[i]);
+    }
+
+    /// @dev Giveaway detector. Along a trade that adds i and removes j the marginal price of j in i
+    /// only rises (r − u_j grows, r − u_i shrinks), so the whole trade is priced at or above the
+    /// starting marginal price. A trade paid at a fraction of it (the "one raw unit" pricing the
+    /// solvers' dust shortcuts produce from a point past a pole) fails here. Slack: the fee, wei
+    /// rounding, the dust a previous exact-input swap left inside, and a factor of four for the
+    /// price steps a tick crossing may introduce.
+    function assertNotAGiveaway(uint8 i, uint8 j, uint256 paid, uint256 got, uint256 p0) internal view {
+        if (p0 == 0 || got == 0) return;
+        uint256 paidWad = paid * scales[i];
+        uint256 gotWad = got * scales[j];
+        // paid ≥ got · p0 / 4, minus the dust the pool may hand back.
+        uint256 floorWad = gotWad * p0 / 1e18 / 4;
+        uint256 dustWad = (4 * dustValueIn(i) + 4) * scales[i];
+        assertGe(paidWad + dustWad, floorWad, "trade priced far below the starting marginal price");
+    }
+
     /// @dev True when the pool is in a configuration the model has no meaning for: a tick is
     /// pinned while the interior's off-peg component points against the pinned ticks' (global ‖w‖
     /// below the boundary sum), or a pinned tick sits above the interior position. The crossing
@@ -462,19 +509,30 @@ contract OrbitalHandler is Test {
             return;
         }
 
+        (uint256 paid, uint256 got) = pricedSwap(trader, key, swapParams(z, -int256(amount)), i, j);
+        assertEq(paid, amount, "exact-in pays exactly the input");
+        assertEq(got, quoted, "exact-in output == quote");
+        if (got == 0) swapsZeroOut++;
+        swapsOk++;
+    }
+
+    /// @dev Runs a quoted swap, records the flows and the crossing, and applies the giveaway
+    /// detector against the marginal price at the start.
+    function pricedSwap(address trader, PoolKey memory key, SwapParams memory params, uint8 i, uint8 j)
+        internal
+        returns (uint256 paid, uint256 got)
+    {
         uint256 inBefore = balance(tokens[i], trader);
         uint256 outBefore = balance(tokens[j], trader);
         uint256 maskBefore = hook.boundaryMask();
-        if (!guardedSwap(trader, key, swapParams(z, -int256(amount)))) return;
-        uint256 paid = inBefore - balance(tokens[i], trader);
-        uint256 got = balance(tokens[j], trader) - outBefore;
-        assertEq(paid, amount, "exact-in pays exactly the input");
-        assertEq(got, quoted, "exact-in output == quote");
+        uint256 p0 = marginalPriceWad(i, j);
+        guardedSwap(trader, key, params);
+        paid = inBefore - balance(tokens[i], trader);
+        got = balance(tokens[j], trader) - outBefore;
+        assertNotAGiveaway(i, j, paid, got, p0);
         ghostSwapIn[i] += paid;
         ghostSwapOut[j] += got;
-        if (got == 0) swapsZeroOut++;
         if (hook.boundaryMask() != maskBefore) crossings++;
-        swapsOk++;
     }
 
     function swapExactOut(uint256 traderSeed, uint256 pairSeed, bool flip, uint256 amountOut) external {
@@ -514,18 +572,10 @@ contract OrbitalHandler is Test {
             return;
         }
 
-        uint256 inBefore = balance(tokens[i], trader);
-        uint256 outBefore = balance(tokens[j], trader);
-        uint256 maskBefore = hook.boundaryMask();
-        if (!guardedSwap(trader, key, swapParams(z, int256(amountOut)))) return;
-        uint256 paid = inBefore - balance(tokens[i], trader);
-        uint256 got = balance(tokens[j], trader) - outBefore;
+        (uint256 paid, uint256 got) = pricedSwap(trader, key, swapParams(z, int256(amountOut)), i, j);
         assertEq(got, amountOut, "exact-out receives exactly the output");
         assertEq(paid, quoted, "exact-out input == quote");
         assertGt(paid, 0, "exact-out never free");
-        ghostSwapIn[i] += paid;
-        ghostSwapOut[j] += got;
-        if (hook.boundaryMask() != maskBefore) crossings++;
         swapsOk++;
     }
 
@@ -762,6 +812,26 @@ contract OrbitalHookInvariantTest is StdInvariant, OrbitalFixture {
                 assertLe(a, int256(L.kNorm) + tol, "interior tick below the interior position");
             }
         }
+    }
+
+    /// @notice No committed state has a coin past its pole (the revision's all-coin check), and no
+    /// committed state is one the revision's start-of-trade fail-safe would refuse: the point never
+    /// sits inside the torus beyond the hook's own tolerance (the same formula `_checkStart` uses,
+    /// so this is exactly "the next quote will not revert InvariantViolated"). Random sequences of
+    /// deposits, withdrawals and swaps must not be able to freeze trading. The handler's
+    /// `isAllowedRefusal` excludes `InvariantViolated` and `BoundaryInverted`, so a quote that did
+    /// revert with either would also fail the run.
+    /// forge-config: default.invariant.runs = 96
+    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_noCoinPastItsPoleAndPoolStaysTradable() public view {
+        (int256[] memory u, uint256 r) = handler.interior();
+        if (r == 0) return;
+        for (uint256 k = 0; k < 3; k++) {
+            assertLe(u[k], int256(r) + 1e6, "coin left past its pole");
+        }
+        int256 f = hook.invariant();
+        assertGe(f, -int256(r * (r / 1e6) + 4 * r * handler.maxScale()), "inside the torus beyond the fail-safe");
     }
 
     /// @notice No sequence of user actions (including guardian pauses and owner fee changes) moves
