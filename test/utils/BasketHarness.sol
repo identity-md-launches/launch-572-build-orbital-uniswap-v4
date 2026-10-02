@@ -155,6 +155,47 @@ abstract contract BasketHarness is Test {
         kb;
     }
 
+    /// @dev Interior reserve per coin, `u_k = x_k − x_bound,k` with
+    /// `x_bound,k = k_bound/√N + s_bound·(x_k − S/N)/‖w‖` (the hook's own formula), and `r_int`.
+    function interior() internal view returns (int256[] memory u, uint256 r) {
+        uint256[] memory x = hook.reserves();
+        uint256 kb;
+        uint256 sb;
+        (r, kb, sb) = hook.consolidated();
+        uint256 s;
+        uint256 q;
+        for (uint256 k = 0; k < x.length; k++) {
+            s += x[k];
+            q += x[k] * x[k];
+        }
+        uint256 w = OrbitalMath.wNorm(s, q, x.length);
+        uint256 sqrtN = hook.sqrtN();
+        u = new int256[](x.length);
+        for (uint256 k = 0; k < x.length; k++) {
+            int256 xb = int256(kb * 1e18 / sqrtN);
+            if (w != 0) xb += int256(sb) * (int256(x[k]) - int256(s / x.length)) / int256(w);
+            u[k] = int256(x[k]) - xb;
+        }
+    }
+
+    /// @dev No coin's interior reserve lies past the sphere's pole (`u_k ≤ r_int`, price ≥ 0), and
+    /// the point is not inside the torus by more than the hook's start-of-trade tolerance, so the
+    /// pool is never left in a state it would refuse to trade from.
+    function assertBelowPoles(string memory what) internal view {
+        (int256[] memory u, uint256 r) = interior();
+        if (r == 0) return;
+        for (uint256 k = 0; k < u.length; k++) {
+            assertLe(u[k], int256(r) + 1e6, string.concat(what, ": coin past its pole"));
+        }
+        uint256 maxScale = 1;
+        for (uint256 k = 0; k < toks.length; k++) {
+            uint256 sc = 10 ** (18 - toks[k].decimals());
+            if (sc > maxScale) maxScale = sc;
+        }
+        int256 f = hook.invariant();
+        assertGe(f, -int256(r * (r / 1e6) + 4 * r * maxScale), string.concat(what, ": inside the torus"));
+    }
+
     function mine(bytes memory code) internal view returns (bytes32) {
         bytes32 h = keccak256(code);
         for (uint256 i = 0; i < 500_000; i++) {

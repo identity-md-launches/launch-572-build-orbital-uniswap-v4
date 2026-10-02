@@ -19,6 +19,11 @@ import {IReactive, ISystemContract, IPayer} from "./IReactive.sol";
 ///
 /// The breaker is latched per emitter: the first out-of-band round of an excursion requests one
 /// callback; further out-of-band rounds only log `DepegPersists` until an in-band round re-arms it.
+/// Because the destination cannot report back and the ReactVM copy's storage changes only through
+/// `react`, a lost delivery would otherwise be final for the excursion: with `retryEveryRounds > 0`
+/// the callback is requested again every that many consecutive out-of-band rounds while tripped
+/// (a bounded cost per round storm instead of one per round; a retry that finds the hook already
+/// paused is acknowledged on the destination without touching it).
 contract OrbitalDepegReactive is IReactive, IPayer {
     /// @dev Reactive system contract; present on the Reactive Network, absent in the ReactVM.
     address public constant SERVICE = 0x0000000000000000000000000000000000fffFfF;
@@ -36,6 +41,9 @@ contract OrbitalDepegReactive is IReactive, IPayer {
     uint64 public immutable callbackGasLimit;
     int256 public immutable pegPrice; // in feed decimals, e.g. 1e8 for a USD feed
     uint256 public immutable bandBps; // allowed deviation, basis points
+    /// @notice While tripped, request the callback again every this many consecutive out-of-band
+    /// rounds (0 = never: strictly one callback per excursion).
+    uint32 public immutable retryEveryRounds;
 
     /// @notice Aggregator currently subscribed to (Reactive Network copy; the ReactVM copy keeps
     /// the value it was deployed with and does not filter on it).
@@ -43,9 +51,13 @@ contract OrbitalDepegReactive is IReactive, IPayer {
     /// @notice Latch per emitter: true after a callback was requested for an excursion that has
     /// not yet seen an in-band round.
     mapping(address => bool) public tripped;
+    /// @notice Out-of-band rounds seen per emitter since its last callback request (only counted
+    /// when retries are enabled).
+    mapping(address => uint32) public roundsSinceCallback;
 
     event DepegDetected(address indexed feed, int256 price, uint256 roundId);
     event DepegPersists(address indexed feed, int256 price, uint256 roundId);
+    event DepegRetried(address indexed feed, int256 price, uint256 roundId);
     event PriceInBand(address indexed feed, int256 price, uint256 roundId);
     event FeedUpdated(address indexed previousFeed, address indexed newFeed);
 
@@ -69,7 +81,8 @@ contract OrbitalDepegReactive is IReactive, IPayer {
         address _callbackContract,
         uint64 _callbackGasLimit,
         int256 _pegPrice,
-        uint256 _bandBps
+        uint256 _bandBps,
+        uint32 _retryEveryRounds
     ) payable {
         if (_feed == address(0) || _callbackContract == address(0) || _pegPrice <= 0 || _bandBps >= 10_000) {
             revert InvalidConfig();
@@ -82,6 +95,7 @@ contract OrbitalDepegReactive is IReactive, IPayer {
         callbackGasLimit = _callbackGasLimit;
         pegPrice = _pegPrice;
         bandBps = _bandBps;
+        retryEveryRounds = _retryEveryRounds;
 
         isReactVm = SERVICE.code.length == 0;
         if (!isReactVm) _subscribe(_feed);
@@ -106,17 +120,33 @@ contract OrbitalDepegReactive is IReactive, IPayer {
         int256 price = int256(log.topic_1);
         uint256 roundId = log.topic_2;
         if (!isOutOfBand(price)) {
-            if (tripped[emitter]) tripped[emitter] = false; // re-arm
+            if (tripped[emitter]) {
+                tripped[emitter] = false; // re-arm
+                roundsSinceCallback[emitter] = 0;
+            }
             emit PriceInBand(emitter, price, roundId);
             return;
         }
         if (tripped[emitter]) {
-            emit DepegPersists(emitter, price, roundId);
+            if (retryEveryRounds != 0 && ++roundsSinceCallback[emitter] >= retryEveryRounds) {
+                roundsSinceCallback[emitter] = 0;
+                emit DepegRetried(emitter, price, roundId);
+                _requestCallback(emitter, price, roundId);
+            } else {
+                emit DepegPersists(emitter, price, roundId);
+            }
             return;
         }
         tripped[emitter] = true;
+        roundsSinceCallback[emitter] = 0;
         emit DepegDetected(emitter, price, roundId);
-        // First argument is a placeholder: the callback proxy replaces it with the RVM id.
+        _requestCallback(emitter, price, roundId);
+    }
+
+    /// @dev Asks the Reactive Network for a callback to `OrbitalDepegCallback.depeg(...)` on the
+    /// destination chain. First argument is a placeholder: the callback proxy replaces it with the
+    /// RVM id.
+    function _requestCallback(address emitter, int256 price, uint256 roundId) internal {
         bytes memory payload =
             abi.encodeWithSignature("depeg(address,address,int256,uint256)", address(0), emitter, price, roundId);
         emit Callback(destinationChainId, callbackContract, callbackGasLimit, payload);

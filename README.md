@@ -32,7 +32,7 @@ Chainlink feed (origin chain) ──AnswerUpdated──▶ OrbitalDepegReactive 
 | `src/reactive/OrbitalDepegCallback.sol` | Destination-chain callback target and hook guardian. |
 | `src/reactive/IReactive.sol` | Locally declared Reactive interfaces (no `reactive-lib` dependency in the audited core). |
 | `script/DeployOrbital.s.sol` | Deployment: deploys token + callback, mines the hook salt, deploys the hook with the callback as guardian and `OWNER` as owner from the constructor, binds the callback, hands it over. Works identically in tests and under `--broadcast`. |
-| `test/` | 85 Foundry tests (success and failure paths, fuzz); `test/mocks/MockERC20.sol` is the mock the floor suite uses, `test/mocks/HookableERC20.sol` a coin with an issuer pause and a receiver hook; `test/utils/BasketHarness.sol` builds a hook for any basket. |
+| `test/` | 92 Foundry tests (success and failure paths, fuzz); `test/mocks/MockERC20.sol` is the mock the floor suite uses, `test/mocks/HookableERC20.sol` a coin with an issuer pause and a receiver hook, `test/mocks/CorruptibleOrbitalHook.sol` a test-only subclass that can move the reserves off the torus; `test/utils/BasketHarness.sol` builds a hook for any basket. |
 | `lib/` | Vendored as plain files: `v4-core` (46c6834), `forge-std` (c6fa5d8), `solmate` (89365b8). No submodules. |
 
 Toolchain: `solc = "0.8.26"`, EVM `cancun`, optimizer 200 runs, no `via_ir`, no `ffi`, no filesystem
@@ -80,7 +80,8 @@ memory copies:
 1. Consolidate the ticks under the current boundary mask.
 2. Solve the torus invariant for the unspecified amount by bisection (`solveOut` / `solveIn`),
    rounding in the pool's favour. The solver refuses trades that cannot reach the surface
-   (`InsufficientLiquidity`) and the hook refuses trades past a token's pole (`SwapTooLarge`).
+   (`InsufficientLiquidity`) and the hook refuses trades that leave any token past its pole
+   (`SwapTooLarge`, see step 4).
 3. Find the first tick plane the segment meets and split the trade there (`tryPlaneStep`, closed
    form). While `xᵢ < xⱼ` (α falling) the candidate is the highest pinned tick, met on the j-heavy
    image of its plane; otherwise the lowest interior tick whose plane lies at or below the segment's
@@ -89,8 +90,25 @@ memory copies:
    introduces; slack `POSITION_TOLERANCE = 1e-15`) is flipped where the trade stands. Flip the tick,
    re-consolidate and continue (each tick leaves and rejoins the interior at most once per trade, so
    at most `2 × levels + 2` segments). Crossings emit `LevelCrossed`.
-4. After the last segment, refuse the trade if it pushed a token past its pole (`SwapTooLarge`) or
-   ended with `‖w‖ < s_bound` (`BoundaryInverted`, unreachable by construction).
+4. After the last segment, refuse the trade if **any** token's interior reserve
+   `uₖ = xₖ − k_bound/√N − s_bound·ŵₖ` ends past the sphere's pole (`uₖ > r_int`, price ≤ 0:
+   `SwapTooLarge`) or if it ended with `‖w‖ < s_bound` (`BoundaryInverted`, unreachable by
+   construction). The pole check covers every coin, not only the one sold: with ticks pinned a coin's
+   boundary share follows the pool's direction `ŵ`, so a trade between two other coins moves a third
+   coin's interior reserve without touching its total, and a coin already sitting near its pole (sold
+   heavily — the depeg the design targets) could be carried across by it. Past the pole the solvers'
+   dust shortcuts would price that coin, and then healthy coins, at one raw unit. The price of the
+   consolidated-torus model is therefore that **a trade between healthy coins is refused while it
+   would push a depegged coin past its pole**; buying the depegged coin, or trading the others back
+   towards the peg, pulls it back and is always allowed, so the pool is never stuck
+   (`OrbitalPole.t.sol`).
+5. Before the first segment, refuse to trade at all (`InvariantViolated`) if the point sits inside the
+   torus by more than rounding: `F < −(r_int²/10⁶ + 4·r_int·10^(18 − min decimals))`. From such a point
+   an exact-output trade would be priced at one raw unit until the surplus is gone. No deposit,
+   withdrawal or swap leaves one (deposits are priced on the tick's own surface, withdrawals take
+   proportional shares, swaps land by bisection; what rounding can leave is a tangent tick landing,
+   ≈ 1e-9·r, or one raw unit of the output coin kept by an exact-input swap), so this is a fail-safe:
+   if the accounting is ever off the surface, swaps and quotes stop while withdrawals keep working.
 
 Fees (`feePpm`, ≤ 1%) are charged on the input and accrue to every LP **in proportion to radius,
 pinned or not** (`feeGrowth` per unit radius, MasterChef-style). This is a deliberate rule: a pinned
@@ -265,6 +283,7 @@ must be re-verified with `cast code` before use; they are configuration, never c
 | Chainlink topic | `keccak256("AnswerUpdated(int256,uint256,uint256)")`; price = `topic_1`, round = `topic_2` |
 | Chainlink feed | Choose one basket coin's USD aggregator (**the aggregator, not the proxy**, since `AnswerUpdated` is emitted by the aggregator). Origin chain id + address are constructor args; the address can be re-pointed later with `setFeed` on the Lasna copy (Chainlink rotates aggregators behind its proxy). Chainlink lists Unichain Sepolia feeds at data.chain.link; not verified in this repo. |
 | Peg / band | `pegPrice` in feed decimals (e.g. `1e8`), `bandBps` (e.g. 200 = ±2%); non-positive prices also trip |
+| `retryEveryRounds` | While tripped, request the callback again every this many consecutive out-of-band feed rounds; `0` = strictly one callback per excursion (a lost delivery is then final for the excursion). Recommended: a small number such as 3–10, sized so that a retry costs one paid callback per that many feed updates during a depeg (feeds update on deviation, so rounds come fast exactly then). |
 | Hook basket | 2–8 ERC-20 stablecoins, with decimals, e.g. USDC (6), USDT (6), DAI (18) |
 | Ticks (`kNorms`, WAD) | ascending, in `(√N − 1, (N−1)/√N]`; N = 3: `(0.7321, 1.1547]`; the tests use `0.74e18, 0.95e18, 1.15e18` |
 | `feePpm` | ≤ 10,000 (1%); tests use 400 (0.04%) |
@@ -284,8 +303,8 @@ must be re-verified with `cast code` before use; they are configuration, never c
 2. Initialise pools for each basket pair with `hooks = <hook>` (fee/tickSpacing are irrelevant for
    Orbital pairs), and the ORB launch pool (pass-through). LPs `approve` the hook and call `deposit`.
 3. **Reactive Lasna**: deploy `OrbitalDepegReactive(originChainId, feedAggregator, 1301, callback,
-   callbackGasLimit, pegPrice, bandBps)` from the `RVM_ID` EOA, funded with REACT; it subscribes in
-   its constructor. Verify `isReactVm() == false` on the Lasna copy.
+   callbackGasLimit, pegPrice, bandBps, retryEveryRounds)` from the `RVM_ID` EOA, funded with REACT;
+   it subscribes in its constructor. Verify `isReactVm() == false` on the Lasna copy.
 4. Fund `OrbitalDepegCallback` with native ETH on Unichain Sepolia: the callback proxy charges it for
    delivered callbacks through `pay()`. Keep both contracts funded; `withdraw` is owner-only.
 5. Rehearse: push a test feed update out of band (or lower `bandBps` on a second deployment) and
@@ -293,15 +312,28 @@ must be re-verified with `cast code` before use; they are configuration, never c
 
 ### Breaker semantics
 
-* **One callback per excursion.** The ReactVM copy keeps a latch per emitting aggregator: the first
-  out-of-band round emits `DepegDetected` and the `Callback`; later out-of-band rounds only emit
-  `DepegPersists` (no callback, nothing charged on the destination chain) until an in-band round
-  re-arms the latch (`PriceInBand`). The ReactVM copy's state can only change through `react`, so
-  there is no owner re-arm; a new excursion after an in-band round trips again.
-* **Resuming during a sustained depeg.** `unpause()` is not undone by the same excursion (the latch
-  holds). If the owner wants the breaker to fire again while the feed is still out of band, it will
-  only do so after the price has been back in band once. To silence the breaker entirely:
-  `setGuardian(0)` on the hook, or `setRvmId(0)` on the callback.
+* **One callback per excursion, plus bounded retries.** The ReactVM copy keeps a latch per emitting
+  aggregator: the first out-of-band round emits `DepegDetected` and the `Callback`; later
+  out-of-band rounds only emit `DepegPersists` (no callback, nothing charged on the destination
+  chain) until an in-band round re-arms the latch (`PriceInBand`). The ReactVM copy's state can only
+  change through `react`, so there is no owner re-arm; a new excursion after an in-band round trips
+  again.
+* **A lost delivery is not final.** The destination cannot report back, so a delivery that fails
+  (callback contract not yet bound to the hook, guardian rotated, callback contract unable to pay
+  the proxy, Reactive dropping the callback) would otherwise leave the pool trading for the whole
+  excursion. With `retryEveryRounds = K > 0` the ReactVM copy re-requests the callback on every K-th
+  consecutive out-of-band round while tripped (`DepegRetried`), so repairing the destination
+  (`setHook`, `setGuardian`, funding) is enough for the next retry to land. A retry that finds the
+  hook already paused is acknowledged on the destination (`DepegAlreadyPaused`) without touching it,
+  and a retry never undoes an owner's `unpause()` any more than the original would have — it calls
+  `guardianPause()` again, so after an owner resume during the same excursion the next retry pauses
+  again; set `retryEveryRounds = 0` if that is unwanted, at the price that a failed delivery is then
+  final for the excursion (`test_withoutRetriesAFailedDeliveryIsFinalForTheExcursion`).
+* **Resuming during a sustained depeg.** With `retryEveryRounds = 0`, `unpause()` is not undone by
+  the same excursion (the latch holds) and the breaker fires again only after the price has been
+  back in band once. With retries enabled, the next retry of the same excursion pauses the pool
+  again: an owner who resumes during a depeg on purpose must silence the breaker first —
+  `setGuardian(0)` on the hook, or `setRvmId(0)` on the callback — and restore it afterwards.
 * **Destination-side checks.** `depeg` records the highest round acted on per aggregator and ignores
   a round at or below it (`StaleRoundIgnored`: duplicates and delayed deliveries), and acknowledges
   a delivery that finds the hook already paused without calling it (`DepegAlreadyPaused`).
@@ -318,9 +350,14 @@ must be re-verified with `cast code` before use; they are configuration, never c
   contract is redeployed; keep `feePpm` sane; never hold user funds (the design gives the owner no
   way to).
 * **Breaker operator**: keep the Lasna contract funded (REACT) and the callback contract funded (ETH);
-  monitor `DepegDetected`/`DepegPersists`/`PriceInBand` on Lasna and
+  monitor `DepegDetected`/`DepegRetried`/`DepegPersists`/`PriceInBand` on Lasna and
   `DepegPauseTriggered`/`DepegAlreadyPaused`/`StaleRoundIgnored` on Unichain Sepolia; alert on
-  `Paused`. **Liveness check**: `PriceInBand` must keep arriving at the feed's heartbeat; if it stops,
+  `Paused`. **Delivery check**: every `DepegDetected`/`DepegRetried` on Lasna must be matched by a
+  `DepegPauseTriggered` or `DepegAlreadyPaused` on the destination within Reactive's delivery time;
+  an unmatched one means the delivery failed (unfunded callback contract, guardian rotated, hook
+  unbound) and, with `retryEveryRounds = 0`, nothing will retry it until the next excursion — pause
+  by hand (`pause()` as owner) and repair the destination. **Liveness check**: `PriceInBand` must
+  keep arriving at the feed's heartbeat; if it stops,
   compare `feed()` on the Lasna copy with the Chainlink proxy's `aggregator()` and `setFeed` if they
   differ. Chainlink heartbeat/deviation determines reaction latency; the breaker is as fast as the
   feed update plus Reactive finality, not instantaneous.
@@ -349,7 +386,7 @@ must be re-verified with `cast code` before use; they are configuration, never c
 forge build && forge test && forge fmt --check
 ```
 
-85 tests across seven suites:
+92 tests across eight suites:
 
 * `OrbitalHook.t.sol` — permissions match the address bits; callbacks refuse non-PoolManager callers;
   pool registration (Orbital vs pass-through, refused while paused); constructor validation; first
@@ -374,8 +411,21 @@ forge build && forge test && forge fmt --check
   withdrawals) while the others move, and is redeemable later; `redeemClaims` failure paths;
   everyone can leave in full after the reviewer's deposit/swap/withdraw sequence and after random
   activity (fuzz).
+* `OrbitalPole.t.sol` — the reported 4-coin sequence (decimals 18/6/18/8, ticks 1.01/1.1/1.3/1.5):
+  ordinary sales and deposits bring coin 2 to `u/r_int ≈ 0.97` with two ticks pinned; the sale of coin
+  3 for coin 0 that would carry coin 2 past its pole without touching it is refused (`SwapTooLarge`,
+  nothing committed, the quote refuses too), a smaller one goes through, the near-pole coin is still
+  buyable at a low but real price (not one raw unit) and that pulls it back, and 1,000 of a healthy
+  coin costs on the order of 1,000; a trade of the others towards the peg pulls the third coin back;
+  fuzz on the 3-coin basket with trades up to 1.5M units, deposits and withdrawals: no coin is ever
+  left past its pole and the point never sinks inside the torus beyond the start-of-trade tolerance;
+  fail-safe: a point forced deep inside the torus (test-only subclass) freezes swaps and quotes
+  (`InvariantViolated`) but not withdrawals, while dust inside keeps trading.
 * `Reactive.t.sol` — end-to-end depeg → `Callback` → proxy delivery → hook paused, duplicate
-  delivery ignored; one callback per excursion, re-armed by an in-band round; the owner's resume is
+  delivery ignored; one callback per excursion, re-armed by an in-band round; with
+  `retryEveryRounds = 3` a delivery that failed (hook not yet bound) is re-requested on round 4 and
+  lands, a later retry while paused is acknowledged, an in-band round resets the count; with
+  `retryEveryRounds = 0` the failed delivery is final for the excursion; the owner's resume is
   not undone by the same excursion; already-paused and stale-round deliveries acknowledged; above-band
   and non-positive prices trip; in-band does nothing; `react` runs only in the ReactVM copy (from the
   RVM id) and refuses unexpected logs; the Reactive Network copy subscribes, unsubscribes and follows

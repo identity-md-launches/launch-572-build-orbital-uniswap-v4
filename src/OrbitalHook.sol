@@ -47,6 +47,10 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     /// by a few units; without the slack a tick one unit off its plane could be left on the wrong
     /// side by a trade that starts there.
     int256 internal constant POSITION_TOLERANCE = 1e3;
+    /// @dev Relative slack on the torus invariant a trade may start from: |F| ≤ r²/1e6 (plus four
+    /// raw units of the coarsest coin, see `_checkStart`). Rounding leaves at most ~r²·4e-9; the
+    /// giveaway state this guards against sits at r²·1e-4 and beyond.
+    uint256 internal constant INVARIANT_TOLERANCE_DIVISOR = 1e6;
 
     // ---- types ------------------------------------------------------------------------------
 
@@ -84,6 +88,7 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
 
     uint256 public immutable n;
     uint256 public immutable sqrtN;
+    uint256 internal immutable _maxScale; // largest 10^(18 − decimals) in the basket
 
     address[] internal _tokens;
     uint256[] internal _scale; // 10^(18 − decimals)
@@ -144,6 +149,7 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     error LengthMismatch();
     error ResidualTooSmall();
     error BoundaryInverted();
+    error InvariantViolated();
 
     // ---- modifiers --------------------------------------------------------------------------
 
@@ -207,6 +213,7 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
             _x.push(0);
             _feeGrowth.push(0);
         }
+        _maxScale = _coarsestScale(decimals);
 
         uint256 kMin = sqrtN - WAD; // exclusive: the equal-price point itself
         uint256 kMax = (basket.length - 1) * WAD * WAD / sqrtN; // inclusive: full range
@@ -224,6 +231,15 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         emit OwnershipTransferred(address(0), _owner);
         emit GuardianUpdated(_guardian);
         emit FeeUpdated(_feePpm);
+    }
+
+    /// @dev 10^(18 − d) for the smallest decimals `d` in the basket (every entry is ≤ 18 here).
+    function _coarsestScale(uint8[] memory decimals) internal pure returns (uint256 maxScale) {
+        maxScale = 1;
+        for (uint256 i = 0; i < decimals.length; i++) {
+            uint256 sc = 10 ** (18 - decimals[i]);
+            if (sc > maxScale) maxScale = sc;
+        }
     }
 
     // ---- hook permissions -------------------------------------------------------------------
@@ -877,6 +893,7 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
             x: _x,
             lv: _loadLevels()
         });
+        _checkStart(t.x, _consolidate(t.lv, t.mask));
 
         // Each tick can leave the interior at most once (while α falls) and rejoin it at most once
         // (while α rises) per trade, plus one final segment.
@@ -919,7 +936,7 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
         }
 
         _apply(t, dIn, dOut);
-        _checkFinal(t.x, t.i, c);
+        _checkFinal(t.x, c);
         return true;
     }
 
@@ -1014,15 +1031,39 @@ contract OrbitalHook is BaseHook, IUnlockCallback {
     /// circle radii (the interior contributes a non-negative multiple of the shared direction); a
     /// trade ending with ‖w‖ below s_bound has gone through the interior's equal-price point with a
     /// tick still pinned, which the crossing logic prevents — refuse it rather than commit an
-    /// inverted state. (2) A trade may not push a token's interior reserve past the sphere's pole
-    /// (price ≤ 0).
-    function _checkFinal(uint256[] memory x, uint8 i, OrbitalMath.Consolidated memory c) internal view {
+    /// inverted state. (2) A trade may not leave any token's interior reserve past the sphere's
+    /// pole (price ≤ 0). Every coin is checked, not only the input: with ticks pinned a coin's
+    /// boundary share `k_bound/√N + s_bound·ŵₖ` follows the pool's direction, so a trade between
+    /// two other coins moves a third coin's interior reserve without touching its total, and a coin
+    /// already near its pole (sold heavily) can be carried across by it. Past the pole the solvers'
+    /// dust shortcuts would then hand that coin, and afterwards healthy coins, out for one raw unit.
+    function _checkFinal(uint256[] memory x, OrbitalMath.Consolidated memory c) internal view {
         (uint256 s, uint256 q) = _sums(x);
         uint256 w = OrbitalMath.wNorm(s, q, n);
         if (w < c.sb) revert BoundaryInverted();
-        int256 xBound = int256(c.kb * WAD / sqrtN);
-        if (w != 0) xBound += int256(c.sb) * (int256(x[i]) - int256(s / n)) / int256(w);
-        if (int256(x[i]) - xBound > int256(c.r)) revert SwapTooLarge();
+        int256 along = int256(c.kb * WAD / sqrtN);
+        for (uint256 k = 0; k < n; k++) {
+            int256 xBound = along;
+            if (w != 0) xBound += int256(c.sb) * (int256(x[k]) - int256(s / n)) / int256(w);
+            if (int256(x[k]) - xBound > int256(c.r)) revert SwapTooLarge();
+        }
+    }
+
+    /// @dev Start-of-trade check: the point must not sit inside the torus by more than rounding.
+    /// From such a point an exact-output trade would be priced at one raw unit (the solver's dust
+    /// shortcut) until the surplus is gone. No deposit, withdrawal or swap leaves one, so this is a
+    /// fail-safe: if the accounting is ever off the surface by more than the tolerance, swaps and
+    /// quotes are refused while withdrawals keep working. The tolerance covers what rounding can
+    /// leave: a tick landing treated as tangent (`tryPlaneStep`, ≤ ~1e-9·r per coordinate) and an
+    /// exact-input swap whose output rounds down to raw units (up to one raw unit of the output
+    /// coin kept by the pool), each shifting F by about 2·r·δ.
+    function _checkStart(uint256[] memory x, OrbitalMath.Consolidated memory c) internal view {
+        if (c.r == 0) return;
+        (uint256 s, uint256 q) = _sums(x);
+        int256 f = OrbitalMath.invariant(s, q, n, sqrtN, c);
+        if (f >= 0) return;
+        uint256 tolerance = c.r * (c.r / INVARIANT_TOLERANCE_DIVISOR) + 4 * c.r * _maxScale;
+        if (uint256(-f) > tolerance) revert InvariantViolated();
     }
 
     function _commit(uint256[] memory x, uint256 mask) internal {

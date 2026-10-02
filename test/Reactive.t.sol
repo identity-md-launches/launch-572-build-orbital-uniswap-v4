@@ -86,7 +86,8 @@ contract ReactiveBreakerTest is OrbitalFixture {
         // test, so the contract knows it is the ReactVM copy (no subscribe call), which is also
         // where `react` runs for real.
         vm.prank(rvmId);
-        reactive = new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
+        reactive =
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, 0);
         vm.deal(address(callback), 1 ether);
         depositAs(lp, WIDE, 1_000_000e18);
     }
@@ -111,20 +112,34 @@ contract ReactiveBreakerTest is OrbitalFixture {
     /// @dev Runs `react` the way the ReactVM does (a transaction from the RVM id) and returns the
     /// payload of the emitted `Callback`, or empty when none.
     function reactAndCapture(IReactive.LogRecord memory rec) internal returns (bytes memory payload, bool emitted) {
+        return reactOn(reactive, address(callback), rec);
+    }
+
+    function reactOn(OrbitalDepegReactive rx, address target, IReactive.LogRecord memory rec)
+        internal
+        returns (bytes memory payload, bool emitted)
+    {
         vm.recordLogs();
         vm.prank(rvmId, rvmId);
-        reactive.react(rec);
+        rx.react(rec);
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bytes32 sig = keccak256("Callback(uint256,address,uint64,bytes)");
         for (uint256 i = 0; i < logs.length; i++) {
             if (logs[i].topics[0] == sig) {
                 assertEq(uint256(logs[i].topics[1]), DEST_CHAIN, "destination chain");
-                assertEq(address(uint160(uint256(logs[i].topics[2]))), address(callback), "callback target");
+                assertEq(address(uint160(uint256(logs[i].topics[2]))), target, "callback target");
                 assertEq(uint256(logs[i].topics[3]), 500_000, "gas limit");
                 payload = abi.decode(logs[i].data, (bytes));
                 emitted = true;
             }
         }
+    }
+
+    function reactOn(OrbitalDepegReactive rx, address target, int256 price, uint256 roundId)
+        internal
+        returns (bytes memory payload, bool emitted)
+    {
+        return reactOn(rx, target, logRecord(price, roundId));
     }
 
     function reactAndCapture(int256 price, uint256 roundId) internal returns (bytes memory payload, bool emitted) {
@@ -182,6 +197,107 @@ contract ReactiveBreakerTest is OrbitalFixture {
         assertFalse(reactive.tripped(feed));
         (, emitted) = reactAndCapture(1.05e8, 7);
         assertTrue(emitted, "a new excursion trips again");
+    }
+
+    /// A lost delivery is not final for the excursion when retries are enabled: with
+    /// `retryEveryRounds = 3` the callback is requested again on every third out-of-band round
+    /// while tripped, so a destination repaired after the first delivery failed still gets paused.
+    function test_retryRequestsTheCallbackAgainWhileTheExcursionLasts() public {
+        OrbitalDepegCallback cb = new OrbitalDepegCallback(address(proxy), address(0), rvmId);
+        vm.deal(address(cb), 1 ether);
+        vm.prank(owner);
+        hook.setGuardian(address(cb));
+        vm.prank(rvmId);
+        OrbitalDepegReactive rx =
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(cb), 500_000, PEG, BAND_BPS, 3);
+        assertEq(rx.retryEveryRounds(), 3);
+
+        // Round 1 trips; the delivery fails because the callback contract has no hook bound yet.
+        (bytes memory payload, bool emitted) = reactOn(rx, address(cb), 0.5e8, 1);
+        assertTrue(emitted, "first round requests a callback");
+        (bool ok, bytes memory ret) = proxy.deliver(address(cb), payload, rvmId);
+        assertFalse(ok);
+        assertEq(bytes4(ret), OrbitalDepegCallback.HookNotSet.selector);
+        assertFalse(hook.paused());
+
+        // The destination is repaired. Rounds 2 and 3 only persist...
+        cb.setHook(address(hook));
+        for (uint256 r = 2; r <= 3; r++) {
+            vm.expectEmit(true, false, false, true, address(rx));
+            emit OrbitalDepegReactive.DepegPersists(feed, 0.5e8, r);
+            (, emitted) = reactOn(rx, address(cb), 0.5e8, r);
+            assertFalse(emitted, "no callback before the retry interval");
+        }
+        assertEq(rx.roundsSinceCallback(feed), 2);
+        assertTrue(rx.tripped(feed));
+
+        // ...and round 4 requests the callback again; this time the pause lands.
+        vm.expectEmit(true, false, false, true, address(rx));
+        emit OrbitalDepegReactive.DepegRetried(feed, 0.5e8, 4);
+        (payload, emitted) = reactOn(rx, address(cb), 0.5e8, 4);
+        assertTrue(emitted, "retry requested");
+        assertEq(rx.roundsSinceCallback(feed), 0);
+        (ok,) = proxy.deliver(address(cb), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused(), "the pause landed on the retry");
+
+        // Rounds 5 and 6 persist; round 7 retries again and, delivered while the hook is already
+        // paused, is acknowledged on the destination without touching the hook.
+        for (uint256 r = 5; r <= 6; r++) {
+            (, emitted) = reactOn(rx, address(cb), 0.5e8, r);
+            assertFalse(emitted);
+        }
+        (payload, emitted) = reactOn(rx, address(cb), 0.5e8, 7);
+        assertTrue(emitted, "a retry per three rounds while tripped");
+        vm.expectEmit(true, false, false, true, address(cb));
+        emit OrbitalDepegCallback.DepegAlreadyPaused(feed, 0.5e8, 7);
+        (ok,) = proxy.deliver(address(cb), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused());
+
+        // An in-band round re-arms the latch and resets the count; the next excursion trips at
+        // once and starts a fresh interval.
+        (, emitted) = reactOn(rx, address(cb), 1.0e8, 8);
+        assertFalse(emitted);
+        assertFalse(rx.tripped(feed));
+        assertEq(rx.roundsSinceCallback(feed), 0);
+        (, emitted) = reactOn(rx, address(cb), 0.5e8, 9);
+        assertTrue(emitted, "new excursion trips");
+        (, emitted) = reactOn(rx, address(cb), 0.5e8, 10);
+        assertFalse(emitted, "count restarted");
+    }
+
+    /// With retries disabled (`retryEveryRounds = 0`) the latch is strictly one-shot: a delivery
+    /// that fails is final for the excursion, and only the next excursion pauses the pool. This is
+    /// the documented trade-off of that setting (one paid callback per excursion).
+    function test_withoutRetriesAFailedDeliveryIsFinalForTheExcursion() public {
+        OrbitalDepegCallback cb = new OrbitalDepegCallback(address(proxy), address(0), rvmId);
+        vm.deal(address(cb), 1 ether);
+        vm.prank(owner);
+        hook.setGuardian(address(cb));
+        vm.prank(rvmId);
+        OrbitalDepegReactive rx =
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(cb), 500_000, PEG, BAND_BPS, 0);
+
+        (bytes memory payload, bool emitted) = reactOn(rx, address(cb), 0.5e8, 1);
+        assertTrue(emitted);
+        (bool ok,) = proxy.deliver(address(cb), payload, rvmId);
+        assertFalse(ok, "HookNotSet");
+        cb.setHook(address(hook));
+        for (uint256 r = 2; r <= 11; r++) {
+            (, emitted) = reactOn(rx, address(cb), 0.5e8, r);
+            assertFalse(emitted, "no retry without the setting");
+        }
+        assertEq(rx.roundsSinceCallback(feed), 0, "rounds are not counted without the setting");
+        assertFalse(hook.paused(), "the pool trades through the rest of the excursion");
+
+        (, emitted) = reactOn(rx, address(cb), 1.0e8, 12);
+        assertFalse(emitted);
+        (payload, emitted) = reactOn(rx, address(cb), 0.5e8, 13);
+        assertTrue(emitted, "next excursion trips");
+        (ok,) = proxy.deliver(address(cb), payload, rvmId);
+        assertTrue(ok);
+        assertTrue(hook.paused());
     }
 
     function test_ownerResumeIsNotUndoneByTheSameExcursion() public {
@@ -265,7 +381,7 @@ contract ReactiveBreakerTest is OrbitalFixture {
         vm.etch(SERVICE, address(sys).code);
         vm.prank(rvmId);
         OrbitalDepegReactive rn =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, 0);
         assertFalse(rn.isReactVm());
         assertEq(MockSystemContract(SERVICE).subCount(), 1, "subscribed in the constructor");
         vm.prank(rvmId, rvmId);
@@ -278,7 +394,7 @@ contract ReactiveBreakerTest is OrbitalFixture {
         vm.etch(SERVICE, address(sys).code);
         vm.prank(rvmId);
         OrbitalDepegReactive rn =
-            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS);
+            new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 500_000, PEG, BAND_BPS, 0);
         MockSystemContract live = MockSystemContract(SERVICE);
         (uint256 chainId, address emitter, uint256 topic0) = live.subs(0);
         assertEq(chainId, ORIGIN_CHAIN);
@@ -360,11 +476,11 @@ contract ReactiveBreakerTest is OrbitalFixture {
 
     function test_reactiveConfigValidation() public {
         vm.expectRevert(OrbitalDepegReactive.InvalidConfig.selector);
-        new OrbitalDepegReactive(ORIGIN_CHAIN, address(0), DEST_CHAIN, address(callback), 1, PEG, BAND_BPS);
+        new OrbitalDepegReactive(ORIGIN_CHAIN, address(0), DEST_CHAIN, address(callback), 1, PEG, BAND_BPS, 0);
         vm.expectRevert(OrbitalDepegReactive.InvalidConfig.selector);
-        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, 0, BAND_BPS);
+        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, 0, BAND_BPS, 0);
         vm.expectRevert(OrbitalDepegReactive.InvalidConfig.selector);
-        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 10_000);
+        new OrbitalDepegReactive(ORIGIN_CHAIN, feed, DEST_CHAIN, address(callback), 1, PEG, 10_000, 0);
     }
 
     function test_reactiveSubscribeManagementIsNetworkOnly() public {
